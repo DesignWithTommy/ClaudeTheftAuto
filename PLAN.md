@@ -110,7 +110,7 @@ Other facts that bound the design (measured by their authors):
 ### 2.4 Shaders and pipelines (`cta-shader`, `cta-pso`)
 - **Translator:** cloned from `victory-shader` (RDNA2 to SSA, EXEC removal, resource tracing, direct DXIL, no DXC). The 26 wave64 programs with no 32-lane form are a known gap.
 - **Cache key = content.** Translated DXIL is stored by its own hash, and the PSO key hashes the DXIL plus the host description, not the translator version or settings (five-star's content store). That ends the 815/855 misses per run.
-- **Journal:** the PSOs actually drawn are journaled (`pipelines-used`, seeded from vilocity's 4,259 names). They are rebuilt at boot on half the cores while the title loads (AnyPS5), into a memory-mapped `ID3D12PipelineLibrary1`.
+- **Journal:** the PSOs actually drawn are journaled (`pipelines-used`, seeded from vilocity's 4,259 names). They are rebuilt at boot on half the cores while the title loads (AnyPS5), into a memory-mapped `ID3D12PipelineLibrary1`. Not new: VIctory-NVIDIA already builds every pipeline ahead (`warm`, 74,251 on this PC), and vilocity and five-star warm from used lists; we copy theirs, and the only change is building the used ~4k first.
 - **On a miss:** a stand-in draws nothing while the real PSO builds (vilocity compat `pso_async.rs`, five-star). Waits are by class: small passes 250 ms, UI and blits 10 s, the lighting chain 60 s. The most-skipped pipelines build first, under a compile-concurrency cap and the RAM budget.
 
 ### 2.5 Kept as cloned
@@ -227,5 +227,5 @@ Either one means this PC caps the game, not the translator.
 - **Replaying translated command chunks, keyed on their inputs:** not found. Dolphin's display-list cache keyed on content alone and was removed.
 - **A VRAM "before" image plus a compute copy-back into the opened home:** a variant of AnyPS5's changed-bytes rule, without RAM twins.
 - **GPU detiling:** done by Xenia, not by any GTA VI runtime.
-- **Not new:** the home sections, opened heaps, write watch, stand-ins, the journal and direct DXIL. Those are cloned, with credit.
+- **Not new:** the home sections, opened heaps, write watch, stand-ins, the journal, prebuilding pipelines (VIctory-NVIDIA, vilocity, five-star) and direct DXIL. Those are cloned, with credit.
 - **The minimum win needs none of the new parts.** That is deliberate: the new parts are upside, not the foundation.
