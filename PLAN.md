@@ -118,7 +118,10 @@ Other facts that bound the design (measured by their authors):
 
 ## 4. Build order (strangler: the game keeps booting at every step)
 0. **Probe.** Its numbers set the in-place read limit, the window size and the budgets. If `FromFileMapping` or protection on opened views fails on this driver, the in-place tier falls back to a copy from a staging pool, and everything else still holds.
-1. **Clone and boot.** Vice-Tay copied whole into crates/apps with credit and renamed `cta-*`. Boot to the world at 1080p, Series X profile. This is the baseline. Add `cta-feed`.
+1. **Clone and boot.** VI-BR-PORT (edsuuu, victory-fork lineage, GPL-3.0) copied whole into crates/apps with credit and renamed `cta-*`. Boot to the world at 1080p, Series S profile. This is the baseline. Add `cta-feed`.
+   - **Why this base:** it has the best result on an 8 GB card, 24.0 fps on a scripted prison walk on an RTX 4060 Ti 8 GB at 1080p. Vice-Tay's 21.1 fps needs a 4090.
+   - **Caveat:** that author had 64 GB of RAM. Every 16 GB rig in the catalog stays under 8 fps (M1LK, ruff-lab, CCS03), so RAM, not the base, is our wall. An earlier VI-BR-PORT pin crashed in `victory-image` on this rig (`6ixlaunch/runs/vibrport-crash2.log`), so the first boot re-checks that.
+   - Parts it lacks are taken from Vice-Tay (same crate layout).
 2. **Census before rebuilding.** Instrument the cloned stream with two counters:
    - (a) the chunk repeat rate frame to frame, which decides whether chunk reuse is worth building;
    - (b) per-block GPU reads against CPU writes, which sizes the tiers.
