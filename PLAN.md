@@ -186,10 +186,29 @@ Either one means this PC caps the game, not the translator.
 
 ## 6. Build order (strangler: the game keeps booting at every step)
 0. **Probe.** Done (results above). It sets the in-place read limit, the window size and the budgets.
-1. **Clone and boot.** VI-BR-PORT (edsuuu, victory-fork lineage, GPL-3.0) copied whole into crates/apps with credit, renamed `cta-*`. Boot to the world at 1080p. Add `cta-feed` with the census counters G1-G5 from the first boot.
-   - **Why this base:** it has the best 8 GB result, 24.0 fps at 1080p on an RTX 4060 Ti 8 GB. Vice-Tay's 21.1 fps needs a 4090.
-   - **Series S first.** Every gate is measured under it. If it draws black (CTA's refused `amd_fidelityfx_upscaler_xbox.dll`), the DLL is stubbed in this step.
-   - An earlier VI-BR-PORT pin crashed in `victory-image` on this rig (`6ixlaunch/runs/vibrport-crash2.log`), so the first boot re-checks that.
+1. **Clone and boot.** M1LK (VIctory + DexNom lineage, GPL-3.0) copied whole into crates/apps with credit. Boot to the world at 1080p. Add `cta-feed` with the census counters G1-G5 from the first boot.
+   - **Why M1LK.** Every runtime in the catalog (about 50) was weighed for this rig, which has 16 GB of RAM, not for its best fps on a big card.
+     - M1LK's reference PC is nearly ours: an RTX 4060 Laptop 8 GB, an i5-12500H and 16 GB of RAM.
+     - It holds there: a 4.5 fps walking median, no crash across tests 14-35, 20-minute sessions, and a 15.8-17.8 GB peak.
+     - It has 35 logged A/B tests on that machine, so the census starts with real numbers.
+   - **Its frame is our target.** A 215 ms frame is about 130-140 ms of CPU preparing (72-86 ms of it copying title memory), about 30 ms of copy-back and about 20 ms of GPU. That is the overhead this design removes.
+   - **Why not the others:**
+
+     | Runtime | Why not |
+     |---|---|
+     | VI-BR-PORT (24 fps, 4060 Ti) | Collapsed here: 0.0-0.3 fps, 15.4 GB private |
+     | AnyXboxX (24 fps, 4070 SUPER) | Collapsed here: 0.1-0.4 fps, 21.5 GB private, 5.1 GB of VRAM spilled |
+     | Vice-Tay `-Machine laptop` (16 GB profile) | 548-1,150 ms world frames |
+     | Neptune | Its own README says 18-21 GB private |
+     | ruff-lab | Tuned for AMD (RX 6600 XT) |
+     | Leonida | Black shadows; measured on 32 GB |
+     | five-star | Black world, about 1 s a frame |
+     | vilocity | Needs 22 GB |
+
+   - **Lessons it already paid for:**
+     - In place made walking slower in M1LK (test 16: 2.6 against 4.5 fps), and so did GPU detile (test 25: 1.3 fps). R5 and R8 are real, which is why those parts stay behind switches after checkpoint M.
+     - In-place *constants* helped (test 22: 4.9 fps), as did batching the indirect clamps (test 27).
+   - **Series S first.** Every gate is measured under it (M1LK tests 8-10 fixed its device removal and black picture).
 2. **Census.** One instrumented 90 s world run, background apps closed. G1-G5 and the R5 counters go into a table here. Each gate's verdict decides whether its step below is built, changed or dropped. This costs a day and can prove a pillar wrong before it is written.
 3. **`cta-mem`, ring transport** (`CTA_MEM=1`). One home in 2 MiB sections, with the VRAM-cache and GPU-owned tiers. The cloned translator emits block read and write sets instead of per-range refreshes. No in place yet.
 4. **Content-keyed shader cache, journal prebuild, stand-ins.**
