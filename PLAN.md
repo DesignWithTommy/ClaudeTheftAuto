@@ -1,69 +1,146 @@
 # ClaudeTheftAuto: plan for a new runtime
 
-Target rig: RTX 4060 8 GB (PCIe 4.0 x8), i5-14400F, 16 GB RAM, 1920x1080 output. GPL-3.0. Cloned parts keep their credit in CREDITS.md. Sources for this plan are Vnity's `docs/FOCUS.md`, `findings.md`, `translators.md`, `research-translation.md`, `research-memory.md`, `r-translate.md` and `features/other-engines.md`.
+Target rig: RTX 4060 8 GB (PCIe 4.0 x8), i5-14400F (6P + 4E, 16 threads), 16 GB RAM, 1920x1080 output. GPL-3.0, all Rust. Cloned code keeps its credit in CREDITS.md.
 
-## The three costs (measured on the rig with Vice-Tay/CTA)
-1. **Memory held twice:** commit 22-36 GB, free RAM down to 3 MB, hangs from 60-80 s. CTA's commit ceiling got 90 s with no hang, but only 5.1 fps.
-2. **CPU per draw:** ~24k draws, submit 91 ms a frame, 2-11 fps. Re-translating unchanged state every frame is most of it.
-3. **Compiles:** 137 s PSO build, and 815 of 855 shader-cache lookups miss per run, so it stutters.
+Sources read: Vice-Tay `3e3fd57` (crates/victory-gpu, victory-hle xmem), vilocity `b959d90` (native + compat), five-star-recomp `6a03b03`, Kelvaroq `92606ea` (patches 0055/0062/0063), AnyPS5 `docs/dev/ARCHITECTURE.md`, CTA run logs on the rig, and Vnity's research docs (FOCUS, findings, translators, research-translation, research-memory, r-translate, other-engines).
 
-Hard limits: the x8 bus moves ~250 MB a frame at 30 fps in practice, and 16 GB RAM cannot hold the pool plus a shadow plus staging. Cutting duplicated commit comes before cutting copied bytes.
+## 1. What the failures teach
 
-## What others tried and where each stops
-| Approach | Who | Where it stops |
-|---|---|---|
-| Host shadow + VirtualProtect watch + card compare | VIctory family, Vice-Tay | Memory held twice; fault per first write; RAM collapse |
-| Shaders read title memory in place | vilocity compat | 33 fps on a 5080; NVIDIA reads host memory "far slower" (AnyPS5: 164 vs 45 ms) |
-| Pagefile sections + a page table read by shaders | BootTest (no licence: idea only) | Every shader access pays the table |
-| ReBAR single copy | victoryperf, CTA switch | 0.3 fps on 8 GB: silently demoted to system memory over budget |
-| OpenExistingHeap windows | xcl, ztrx, TuxBox | 4095 MiB per window; FromAddress locks pages and blocks VirtualProtect; tile mappings into it remove the device |
-| Import where it can, copy where it must, write watch | AnyPS5 (PS5) | Closest design; per-resource policy, Vulkan only |
-| Translate on first use, live compile | almost all | Stalls; vilocity hides them with stand-ins that draw nothing |
-| Re-translate every command list every frame | all | 91 ms submit |
+The game already boots, loads and draws the 3D world under several runtimes. What fails is cost. There are two lineages, and they fail in opposite ways.
 
-None of them place memory per block by measured use, and none reuse last frame's translated command chunks.
+**Copy lineage** (VIctory, Vice-Tay, vilocity, CTA, Kelvaroq's public build):
+- Every range the GPU touches gets a host copy. Big buffers have four: title bytes, a system-RAM staging side, a VRAM card side and a "before" twin used to find GPU writes. Textures have three (tiled title bytes, staging, VRAM).
+- The result is 22-27 GB of RAM at 1080p (vilocity), and 17.5 GB private with 634 MB free on our rig before it hangs.
+- All bookkeeping runs at submit, on one thread. On the 4090 with the Series S profile, a 47.3 ms frame is 33.7 ms "preparing" plus 12.6 ms copying back.
+- On our rig the bad frames show what it costs: 6.5 GB a frame checked by the watch, 99% of it unchanged. Also 18k refreshes, 218k page faults, a 2.4 s heap pass, and 5,300 draws dropped for want of a pipeline.
 
-## Architecture
+**In-place lineage** (five-star-recomp by default, Kelvaroq 0063, vilocity compat):
+- Title memory is `SEC_COMMIT` sections, opened as D3D12 heaps, and shaders read it by console address through a page map. There is one copy and no write tracking for buffers.
+- But that memory sits in system RAM, so every GPU access crosses PCIe, plus two dependent map loads. The result is 200-400 ms world frames, and five-star's own roadmap says "game memory in video memory".
+- AnyPS5 measured the same thing on NVIDIA: draws took 164 ms reading in place against 45 ms with copies.
 
-### 1. One backing, placed per 64 KiB block by measured use (memory)
-- **Backing:** the title's pool is `SEC_COMMIT` file-mapped sections at its fixed address, committed on first touch (BootTest idea), reserved with `MEM_WRITE_WATCH`. There is no CPU shadow copy.
-- **CPU dirty:** one `GetWriteWatch(RESET)` a frame, stamped into 64 KiB blocks with epochs (AnyPS5 `GuestMemory.cpp`, port). There is no VirtualProtect fault path. This is also a prerequisite, because opened heaps block VirtualProtect.
-- **GPU view:** sections are opened with `OpenExistingHeapFromFileMapping` (no page lock, 0.2 ms per 256 MiB; ztrx `inplace.rs`, copy) in windows under 4095 MiB (xcl `uma.rs`, copy). The import-settle step drops the driver's false dirty marks (AnyPS5).
-- **Placement:** every block counts its GPU reads and CPU writes per frame and gets a tier, with a policy that changes as the counts do:
-  - **In place:** read a few times (under ~512 reads; AnyPS5's NVIDIA limit). The GPU reads system memory directly, with no copy.
-  - **VRAM cache:** hot blocks, copied once and kept valid by per-block valid bits. Only the ranges a draw reads and that are invalid get uploaded, in one copy-queue batch a frame.
-  - **GPU-owned:** written only by the GPU (render targets). Lives in VRAM, and changed bytes are copied back only when the CPU touches it (Ryujinx flush-on-access, AnyPS5 changed-bytes copy-back).
-  - **Cold:** untouched for N frames. Evicted from VRAM, LRU.
-- **Budgets the runtime enforces, not the driver:** a VRAM cap from `QueryVideoMemoryInfo` (about 6.5 GB on the 4060), an import cap, a commit ceiling and a free-RAM floor (five-star-recomp limits, port), plus a compile-concurrency cap. No sparse tiles at pool scale (xcl saw multi-minute stalls).
-- **Fallback:** the plain copy path behind a switch, if `D3D12_FEATURE_EXISTING_HEAPS` is missing. Microsoft calls opened heaps diagnostics-only.
+**The bus is not the limit.** On the 4090 run, 87 MB goes up and 30 MB comes back a frame, about 3.5 GB/s at 30 fps, against ~13 GB/s usable on x8. The limits are three things:
+1. Duplicated memory, which takes RAM.
+2. Bookkeeping that scales with memory size, not with what changed.
+3. Serial submit-time work.
 
-### 2. Incremental frame translation (CPU)
-- The title's command lists are hashed in chunks keyed by state plus the epochs of the blocks they touch. An unchanged chunk replays last frame's translated D3D12 commands; only changed chunks are translated again.
-- Inside a changed chunk, only dirty state is re-bound (DXVK/Xenia dirty bits, United `LIST_REUSE`), one-record ExecuteIndirect calls are merged (victoryperf `batch.rs`, copy), and the heap pass re-checks only marked slots (United `heap_pass.rs`, copy).
-- Translation runs one frame behind on worker threads (decode, then translate, then record one list per worker, then submit) with kept threads. Uploads and readbacks stay off the recording thread (copy-queue lanes).
+Other facts that bound the design (measured by their authors):
+- `OpenExistingHeapFromFileMapping` needs `SEC_COMMIT`, locks nothing and takes 0.2 ms per 256 MiB.
+- `FromAddress` pins every page and blocks `VirtualProtect`.
+- Tile mappings into an opened heap remove the device.
+- Windows must stay under 4095 MiB.
+- Write watch does not work on section views. Guards cost about 5 µs per change.
+- 2 MiB sections cut map calls from 848 to 117 ms/s, a 2x fps gain (vilocity).
+- The title creates 84k pipelines but draws with about 2-4k (a 4,259-name used list exists).
+- The title calls the command-list vtable once per command, 45-60k times a frame. There is no PM4 to parse.
+- The Series S profile drops the ray-traced and hair passes. CTA's Series S is black because `amd_fidelityfx_upscaler_xbox.dll` is refused.
 
-### 3. Shaders ahead of time
-- All ~25.9k title programs are translated offline into a content-keyed cache that is stable across translator builds. The run only loads them, which ends the 815/855 misses.
-- Clone: five-star-recomp's structured control-flow recovery and its direct DXIL backend (5-20x faster than dxc, with a dxc fallback), its resumable `setup` step runner and its auto-warm when the translator changes; victoryperf `precompile.rs`; WARP instruction checks run offline.
-- At run time a miss gets a stand-in that draws nothing (vilocity `pso_async.rs`) while the real pipeline builds in the background, under the compile cap. PSO keys are journaled and the missing list is written out (BootTest idea) for the next prebuild.
+## 2. The architecture
 
-### 4. Measured from day one
-- Every frame, one shared-memory feed reports frame time, submit time, commit, free RAM, VRAM per tier, MB copied, chunks reused vs retranslated, and PSO misses.
-- `cta probe` runs first: copy-queue H2D GB/s on the rig, EXISTING_HEAPS, OPTIONS16, and local and non-local budgets.
-- Each feature is proven with a 1 s replay A/B, then one 90 s run at 1080p.
+**One home, many caches, decided per block.** Title memory has exactly one home: pagefile-backed sections in RAM. VRAM is a cache with its own valid bits, never a second home. Each 64 KiB block carries counters and a tier, and moves between tiers as its use changes. Work scales with what changed this frame, never with how much memory exists.
 
-## What gets cloned unchanged
-Vice-Tay's PE loader, its HLE of the console libraries (xmem, d3d12_xs, files, audio, input, DirectStorage/BCPack, saves), `VICTORY_OUTPUT` 1080p patching and the RDNA2 decoder. These already work and are not where the cost is.
+```
+ title threads ──calls──► word stream (cloned thin recorder)
+                              │ 1024-word chunks
+                              ▼
+                 chunk workers (E-cores): hash ─► reuse? ─► replay cached host list
+                              │ no                      
+                              ▼                          
+                 translate chunk ─► host list + read set + write set (blocks)
+                              │
+                              ▼
+ residency (submit lane):  read sets ∩ invalid-in-VRAM ─► one copy-queue batch, section ─► VRAM
+                           write sets ─► mark GPU-owned; copy back on demand
+                              │
+                              ▼
+                 ExecuteCommandLists ─► present (one frame ahead)
+```
 
-## Order
-0. `cta probe`. Its numbers decide the in-place limits and the budgets.
-1. Skeleton: the cloned loader and HLE booting to the first Present, plus the telemetry feed.
-2. Write watch with block epochs, and no CPU shadow. Goal: commit under 16 GB.
-3. Opened-heap windows and placement tiers, with the copy path as fallback. Goal: under 250 MB copied a frame.
-4. Offline shader cache, stand-ins, compile cap. Goal: no stutter, no 137 s build.
-5. Incremental chunk translation and threaded recording. Goal: submit under 20 ms.
-6. In the world at 1080p, no RAM collapse, then 30 fps.
+### 2.1 Memory core (`cta-mem`)
+- **Home:** physical pages are 2 MiB `SEC_COMMIT` sections (vilocity's size, five-star's commit mode), committed when first touched (BootTest idea). They are mapped at the title's addresses with `MapViewOfFile3`. A second "beside" view lets our own writes skip the guards (vilocity `land.rs`).
+- **GPU access to the home:** sections are opened with `OpenExistingHeapFromFileMapping` in windows under 4095 MiB, each with one placed buffer (ztrx/vilocity `inplace.rs`, Kelvaroq 0063). No `FromAddress`, no tiles.
+- **CPU change tracking, cheapest source first:**
+  - Private allocations use `MEM_WRITE_WATCH`, with one `GetWriteWatch(RESET)` a frame (cloned).
+  - Section views are guarded only while their block is VRAM-cached. Blocks that stay in place are never guarded, because the GPU reads the home directly.
+  - Every block gets an epoch stamp, and a resource proved current stays proved until a block under it moves (AnyPS5 proof stamps, port).
+- **Tiers per 64 KiB block** (new). Counters are updated from the chunk read and write sets, not by scanning.
 
-## Risks
-- Opened heaps have no public performance data, and Microsoft discourages them. Step 0 or 3 may force the copy fallback for all tiers.
-- Chunk reuse is only valid if every input a chunk reads is in its key. A missed input draws stale frames, so a check mode retranslates and compares.
+| Tier | Rule | Where the GPU reads | Upkeep |
+|---|---|---|---|
+| In place | read by few draws, under ~512 reads (AnyPS5's NVIDIA limit), or written by the CPU every frame and read once | the home, over PCIe | none: no copy, no guard |
+| VRAM cache | read often | a VRAM copy | guard plus a valid bit; re-upload only ranges a chunk reads that went invalid |
+| GPU-owned | written by the GPU (render targets, UAV outputs) | VRAM only | the home is protected; on a CPU touch, only changed dwords are copied back |
+| Cold | no use for N frames | nothing | VRAM copy evicted (LRU); the home pages may page out |
+
+- **Copy-back without RAM twins** (new variant of AnyPS5's changed-bytes rule): the "before" image of a GPU-owned block lives in VRAM, not in RAM. A compute pass compares now with before, and writes only changed dwords straight into the opened home heap. A CPU store in between survives, and there are no land threads and no readback buffers. It runs lazily: the home pages are no-access, and the first CPU touch triggers it. Blocks the title reads every frame are copied back eagerly at the end of the frame.
+- **Budgets enforced by us, not the driver:**
+  - VRAM about 6.5 GB, from `QueryVideoMemoryInfo`, with eviction from 75% down to 70% (vilocity).
+  - A commit ceiling and a free-RAM floor (five-star flags and CTA's 0014).
+  - Promotion is refused under pressure, so a block stays in place instead of the driver silently spilling (the REBAR=1 lesson).
+
+### 2.2 Command path (`cta-stream`)
+- **Recording:** cloned from Vice-Tay's thin word stream. The title's lists keep zero put limits, so every command is a vtable call appended as `op|len` plus its arguments.
+- **Chunk reuse** (new):
+  - Each 1024-word chunk is hashed with xxh3 (~2.4 MB of words a frame, ~0.1 ms).
+  - The key is the words plus the bound state at the chunk's start plus the epochs of the blocks in the chunk's last read set.
+  - A hit replays last frame's closed host list. Constants and matrices live in title memory, not in the stream, so a camera move changes data, not words.
+  - Per-draw ring slots, such as user SGPRs, are double-buffered per chunk so a reused list points at stable addresses.
+  - A check mode retranslates a sample of hits and compares. That is the guard against Dolphin's failure (it reused by content alone, then removed the feature).
+- **Translation of misses:** chunk workers run on the E-cores and the title stays on the P-cores (vilocity: the title on its own die cut 37.1 to 34.8 ms).
+  - Each worker emits the host list and the chunk's read and write sets at block granularity. Per-draw shadow lookups go away.
+  - Dirty-state binding and indirect merge are cloned (United `LIST_REUSE`, victoryperf `batch.rs`), as is the batched indirect clamp (vilocity).
+- **Submit lane:** it does only three things: union the read sets, issue one upload batch on the copy queue, then execute. The work that made "preparing" 33.7 ms (refresh steps, snapshots, card compare, heap-record waits) does not exist here.
+- **Descriptors:** Vice-Tay's 12-byte records in RDNA-sized slots and its inline CBV addresses are cloned. Slot changes come from the `Create*View`/`CopyDescriptors` calls and from guarded heap pages. There is no 470k-slot rescan, and only the used part of a page is published (Kelvaroq 0055 fingerprint).
+
+### 2.3 Textures (`cta-tex`)
+- **GPU detiling** (new for these runtimes; Xenia does it): the tiled bytes are copied raw, from the opened home heap straight to VRAM. A compute shader then detiles into the texture. This removes CPU detiling, the 64 MiB staging pools and one RAM copy per texture. The detiler is ported from the addrlib-derived CPU code in `victory-formats`.
+- **Change detection:** block epochs instead of per-texture hashes every 8th frame. The 4/12/40/120/400-frame recheck becomes unnecessary.
+- **Kept:** pooled placement heaps (vilocity `pool.rs`, 310 to 6 µs per allocation), mips on demand through reserved textures (not through title memory), and 3 GB kept for render targets made budget-aware.
+
+### 2.4 Shaders and pipelines (`cta-shader`, `cta-pso`)
+- **Translator:** cloned from `victory-shader` (RDNA2 to SSA, EXEC removal, resource tracing, direct DXIL, no DXC). The 26 wave64 programs with no 32-lane form are a known gap.
+- **Cache key = content.** Translated DXIL is stored by its own hash, and the PSO key hashes the DXIL plus the host description, not the translator version or settings (five-star's content store). That ends the 815/855 misses per run.
+- **Journal:** the PSOs actually drawn are journaled (`pipelines-used`, seeded from vilocity's 4,259 names). They are rebuilt at boot on half the cores while the title loads (AnyPS5), into a memory-mapped `ID3D12PipelineLibrary1`.
+- **On a miss:** a stand-in draws nothing while the real PSO builds (vilocity compat `pso_async.rs`, five-star). Waits are by class: small passes 250 ms, UI and blits 10 s, the lighting chain 60 s. The most-skipped pipelines build first, under a compile-concurrency cap and the RAM budget.
+
+### 2.5 Kept as cloned
+`victory-pe`, `victory-loader`, `victory-hle` (xmem rewritten onto `cta-mem`, the rest as-is: files, audio, input, DirectStorage/BCPack, saves), `victory-formats`, 1080p output patching (`VICTORY_OUTPUT`), DRED and the crash reporter. They work and are not where the cost is.
+
+## 3. Telemetry (`cta-feed`), present from the first boot
+- **Every frame:** frame, submit and GPU ms; commit and free RAM; VRAM by tier; MB up and back; blocks per tier and promotions; chunks hit, missed and checked; PSO misses and stand-in draws; guard faults.
+- **`cta probe`**, a standalone exe with no game:
+  - copy-queue speed both ways
+  - `EXISTING_HEAPS` support and `FromFileMapping` open cost on the 4060 driver
+  - whether `VirtualProtect` still works on a section view while its heap is open
+  - GPU read speed from the opened heap against VRAM, per access pattern
+  - the 2 MiB map cost
+- **Proof:** every change is a 1 s replay A/B, then one 90 s run at 1080p.
+
+## 4. Build order (strangler: the game keeps booting at every step)
+0. **Probe.** Its numbers set the in-place read limit, the window size and the budgets. If `FromFileMapping` or protection on opened views fails on this driver, the in-place tier falls back to a copy from a staging pool, and everything else still holds.
+1. **Clone and boot.** Vice-Tay copied whole into crates/apps with credit and renamed `cta-*`. Boot to the world at 1080p, Series X profile. This is the baseline. Add `cta-feed`.
+2. **Census before rebuilding.** Instrument the cloned stream with two counters:
+   - (a) the chunk repeat rate frame to frame, which decides whether chunk reuse is worth building;
+   - (b) per-block GPU reads against CPU writes, which sizes the tiers.
+   This costs a day and can prove a pillar wrong before it is built.
+3. **`cta-mem` home and tiers**, behind `CTA_MEM=1`, with the cloned shadow path as the fallback. Goals: commit under 14 GB, no free-RAM collapse in 90 s, and no 6.5 GB watch scans.
+4. **Content-keyed shader cache, journal prebuild, stand-ins.** Goals: no 137 s build, and no draws dropped in the world after the first minute.
+5. **Chunk workers with read and write sets, and the slim submit lane** (`CTA_STREAM=1`). Goal: the submit lane under 5 ms.
+6. **Chunk reuse with check mode** (`CTA_REUSE=1`), if step 2 found enough repeats.
+7. **GPU detile and lazy copy-back.** Goal: copy-back under 3 ms, and no texture staging in RAM.
+8. **The Series S profile** (stub the FidelityFX upscaler DLL), for fewer passes on the 4060.
+
+**Targets:** 30 fps in the world at 1080p, with the submit lane under 5 ms, worker translation under 15 ms in parallel, uploads under 4 ms, commit under 14 GB and VRAM under 7 GB.
+
+## 5. What is new here, honestly
+- **Placement per block, from use, with migration**, for a console's shared memory: not found in any emulator. The closest prior art is NVIDIA's UVM access counters, which work on GPU reads only and inside the driver.
+- **Replaying translated command chunks, keyed on their inputs:** not found. Dolphin's display-list cache keyed on content alone and was removed.
+- **A VRAM "before" image plus a compute copy-back into the opened home:** a variant of AnyPS5's changed-bytes rule, without RAM twins.
+- **GPU detiling:** done by Xenia, not by any GTA VI runtime.
+- **Not new:** the home sections, opened heaps, write watch, stand-ins, the journal and direct DXIL. Those are cloned, with credit.
+
+## 6. Risks
+- Opened heaps are "diagnostics only" per Microsoft, and there is no NVIDIA performance data. Step 0 decides, and copy fallbacks keep every tier working.
+- A chunk reused with a missed input draws a stale frame. The check mode is always on in debug runs.
+- Lazy copy-back puts a GPU round trip on a CPU fault. Blocks read every frame go eager, so steady-state faults stay rare.
+- 16 GB RAM: the title alone may need most of it. Cold home pages paging out is the release valve, so watch hard faults in the feed.
