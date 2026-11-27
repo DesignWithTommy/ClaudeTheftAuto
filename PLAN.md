@@ -65,7 +65,10 @@ Other facts that bound the design (measured by their authors):
 
 ### 2.1 Memory core (`cta-mem`)
 - **Home:** physical pages are 2 MiB `SEC_COMMIT` sections (vilocity's size, five-star's commit mode), committed when first touched (BootTest idea). They are mapped at the title's addresses with `MapViewOfFile3`. A second "beside" view lets our own writes skip the guards (vilocity `land.rs`).
-- **GPU access to the home:** sections are opened with `OpenExistingHeapFromFileMapping` in windows under 4095 MiB, each with one placed buffer (ztrx/vilocity `inplace.rs`, Kelvaroq 0063). No `FromAddress`, no tiles.
+- **GPU access to the home, two transports:**
+  - **Opened windows** (default when the probe passes): sections are opened with `OpenExistingHeapFromFileMapping` in windows under 4095 MiB, each with one placed buffer (ztrx/vilocity `inplace.rs`, Kelvaroq 0063). No `FromAddress`, no tiles.
+  - **Upload ring** (fallback, always built): a fixed 256 MB upload heap. The CPU copies the blocks a batch reads from the home into it, then the copy queue moves them to VRAM. It is bounded and reused every frame, so it is never a second home.
+  - The RAM saving comes from the single home, not from in place, so it holds with either transport.
 - **CPU change tracking, cheapest source first:**
   - Private allocations use `MEM_WRITE_WATCH`, with one `GetWriteWatch(RESET)` a frame (cloned).
   - Section views are guarded only while their block is VRAM-cached. Blocks that stay in place are never guarded, because the GPU reads the home directly.
@@ -143,34 +146,67 @@ Other facts that bound the design (measured by their authors):
 - **The whole home cannot stay open.** Each opened byte counts against the 7.4 GB non-local budget and the working set. The home is opened in 64-256 MB windows on demand, LRU, under that budget (AnyPS5 import windows, five-star `--section-heap-budget`). Blocks outside an open window are copied to VRAM instead of read in place.
 - **2 MiB sections are confirmed.**
 
-## 4. Build order (strangler: the game keeps booting at every step)
-0. **Probe.** Done, results above. Its numbers set the in-place read limit, the window size and the budgets. If `FromFileMapping` or protection on opened views fails on this driver, the in-place tier falls back to a copy from a staging pool, and everything else still holds.
-1. **Clone and boot.** VI-BR-PORT (edsuuu, victory-fork lineage, GPL-3.0) copied whole into crates/apps with credit and renamed `cta-*`. Boot to the world at 1080p, Series S profile. This is the baseline. Add `cta-feed`.
-   - **Why this base:** it has the best result on an 8 GB card, 24.0 fps on a scripted prison walk on an RTX 4060 Ti 8 GB at 1080p. Vice-Tay's 21.1 fps needs a 4090.
-   - **Caveat:** that author had 64 GB of RAM. Every 16 GB rig in the catalog stays under 8 fps (M1LK, ruff-lab, CCS03), so RAM, not the base, is our wall. An earlier VI-BR-PORT pin crashed in `victory-image` on this rig (`6ixlaunch/runs/vibrport-crash2.log`), so the first boot re-checks that.
-   - Parts it lacks are taken from Vice-Tay (same crate layout).
-2. **Census before rebuilding.** Instrument the cloned stream with two counters:
-   - (a) the chunk repeat rate frame to frame, which decides whether chunk reuse is worth building;
-   - (b) per-block GPU reads against CPU writes, which sizes the tiers.
-   This costs a day and can prove a pillar wrong before it is built.
-3. **`cta-mem` home and tiers**, behind `CTA_MEM=1`, with the cloned shadow path as the fallback. Goals: commit under 14 GB, no free-RAM collapse in 90 s, and no 6.5 GB watch scans.
-4. **Content-keyed shader cache, journal prebuild, stand-ins.** Goals: no 137 s build, and no draws dropped in the world after the first minute.
-5. **Chunk workers with read and write sets, and the slim submit lane** (`CTA_STREAM=1`). Goal: the submit lane under 5 ms.
-6. **Chunk reuse with check mode** (`CTA_REUSE=1`), if step 2 found enough repeats.
-7. **GPU detile and lazy copy-back.** Goal: copy-back under 3 ms, and no texture staging in RAM.
-8. **The Series S profile** (stub the FidelityFX upscaler DLL), for fewer passes on the 4060.
+## 4. Why it should work
 
-**Targets:** 30 fps in the world at 1080p, with the submit lane under 5 ms, worker translation under 15 ms in parallel, uploads under 4 ms, commit under 14 GB and VRAM under 7 GB.
+Each reason rests on a measurement, not on hope.
+1. **The collapse is the runtime's overhead, not the game.** Under VI-BR-PORT, menus and loading ran at 30 fps on 9.7 GB. The world died when three things piled on top of the title:
+   - about 5.7 GB of the runtime's own copies: write-combined 5,607 MB, other private 2,183 MB, heap segments 1,829 MB and opened windows 1,783 MB, reserved;
+   - 6.8 GB of checks a frame;
+   - 2,580 pipelines still being made.
+   One home removes the copies. Read sets replace the scans. A journal builds the pipelines before the world.
+2. **The title touches far less than it reserves.** In the world, its page pool held 3,977 MB with 0 MB resident, its heaps 3,069 MB (628 resident) and its views 6,160 MB (578 resident). A section committed at first touch pays only for touched 2 MiB pieces.
+3. **The bus has room.** A frame needs about 3.5 GB/s at 30 fps. The probe measured 12-13 GB/s both ways.
+4. **The primitives work on this driver** (step 0). Sections open as heaps. Guards still work on opened views. The home is as fast a copy source as an upload heap, so no staging copy is needed. Data read once costs the same in place as copied.
+5. **The hard, working parts are cloned, not rewritten:** the PE loader, HLE, the shader translator, the thin recorder and descriptors. New code covers only memory placement, the submit lane and reuse, which are the parts that fail.
+6. **Nothing can fall below the baseline.** Each pillar ships behind a switch, with the cloned path as the fallback. A pillar that loses its A/B is switched off, not debated.
 
-## 5. What is new here, honestly
+## 5. Why it might not, and what decides
+
+Ranked by likelihood times damage. Each risk gets a gate measured in the baseline census (step 2), a pass line and a fallback.
+
+| # | Risk | Gate (measured in the census) | Pass | If it fails |
+|---|---|---|---|---|
+| R1 | **16 GB cannot hold the title plus Windows.** Idle, this PC has only 5.8 GB free of 16.2 GB with the usual apps open. In-world resident figures were shrunk by trimming, so the title's true need is unknown. | G1: title-owned commit and resident (VirtualQuery map at 30 s and 90 s in the world, background apps closed), apart from runtime-owned memory | title resident ≤ 7 GB, and projected free RAM ≥ 1.5 GB once runtime copies are gone | Series S profile, a smaller texture pool with top mips dropped, and cold home pages left to page out (watch hard faults). If the title alone needs more than ~9 GB, 16 GB cannot hold it, and we say so plainly (32 GB is the fix). |
+| R2 | **The 14400F is too slow even with zero overhead.** Vice-Tay used 624 CPU-seconds a minute on a 9950X3D (about 10 cores busy). The title is native x64, and its own threads may need the whole CPU. | G3: CPU ms a frame per thread class (title vs runtime), and the title's longest thread | title critical path ≤ 25 ms | 25-40 ms: target 20-25 fps with steady pacing. Over 40 ms: the cap is the game's own CPU. The design cannot fix that, and we stop chasing fps. |
+| R3 | **Chunks rarely repeat.** Ring-allocated constant addresses, per-frame descriptor indices or counters in the words would change every hash. | G2: share of chunk bytes repeated frame to frame, raw and with ring addresses made relative | ≥ 50% (normalized counts) | Skip reuse (step 7). Parallel translation on the E-cores still takes the work off the submit lane. |
+| R4 | **8 GB of VRAM is too small.** Render targets, hot textures and hot buffers may exceed ~6 GB, and driver spill is a cliff (vilocity: card share 6 ms became 64-122 ms). | G4: VRAM per tier, Series S, 1080p | GPU working set ≤ 6 GB | Mips on demand, top-mip drop, and our own eviction holding 70-75% of budget. Promotion is refused before the driver spills. |
+| R5 | **In place is slower in the game than in the probe.** Scattered reads, atomics or GPU writes to system RAM are slow (five-star's own finding). Opening a window costs 17 ms per 256 MB. | per-block read counters from the census, plus an A/B of in-place against copy | in-place blocks under ~512 reads; window churn off the submit lane | Move everything to the VRAM-cache tier: vilocity's design without RAM shadows. In place is a saving, not a load-bearing pillar. |
+| R6 | **Opened heaps are "diagnostics only".** They may be a slow path, may break with a driver update, or may fail under load. | the step 0 probe, re-run after each driver update; device-removed count in the feed | no removals; probe speeds held | The upload-ring transport (2.1). It still has one home, so the RAM saving holds. |
+| R7 | **Copy-back is too frequent.** Lazy copy-back takes a GPU round trip on a CPU fault. | G5: blocks written by the GPU then read by the CPU, per frame, and their bytes | under ~200 faults a frame | Copy back eagerly at the end of the frame for those blocks. Hash-compare whole pieces (cloned) for buffers the CPU never writes, so the VRAM before-image is kept only where it is needed. |
+| R8 | **The new parts draw wrong.** Stale reuse, or a GPU detile that mismatches. | check mode: retranslate a sample of reused chunks; compare GPU detile with the cloned CPU detile, per format | zero mismatches over a 90 s run | Turn the part off by its switch. A detile mismatch falls back to CPU detile into a pooled ring, for that format only. |
+| R9 | **The first prewarm is long.** Five-star took about 35 min for about 3,850 pipelines. | prewarm time on the 6P+4E, and stand-in draws in the world | stand-ins near zero after the first minute | A one-time cost. Stand-ins keep frames moving while it finishes, and later boots load the pipeline library. |
+| R10 | **Effort stalls.** VI-BR-PORT is a large tree, and the four new pieces are real work. | — | every step lands with a run and a number | The strangler order below. The smallest step with the biggest RAM win goes first, and a minimum win is defined before any novel part. |
+
+**Minimum win.** Suppose reuse, in place and GPU detiling all fail. The single home with the upload ring, read sets in place of scans, and prebuilt pipelines still remove what killed the world. The bar for that: stable 20 fps at 1080p Series S, no free-RAM collapse in 90 s, and commit under 14 GB. 30 fps is the stretch goal, and only if G3 passes.
+
+**Stop lines** (said plainly, not worked around):
+- G1 shows the title alone needs more than ~9 GB resident.
+- G3 shows the title's own threads need more than 40 ms a frame.
+Either one means this PC caps the game, not the translator.
+
+## 6. Build order (strangler: the game keeps booting at every step)
+0. **Probe.** Done (results above). It sets the in-place read limit, the window size and the budgets.
+1. **Clone and boot.** VI-BR-PORT (edsuuu, victory-fork lineage, GPL-3.0) copied whole into crates/apps with credit, renamed `cta-*`. Boot to the world at 1080p. Add `cta-feed` with the census counters G1-G5 from the first boot.
+   - **Why this base:** it has the best 8 GB result, 24.0 fps at 1080p on an RTX 4060 Ti 8 GB. Vice-Tay's 21.1 fps needs a 4090.
+   - **Series S first.** Every gate is measured under it. If it draws black (CTA's refused `amd_fidelityfx_upscaler_xbox.dll`), the DLL is stubbed in this step.
+   - An earlier VI-BR-PORT pin crashed in `victory-image` on this rig (`6ixlaunch/runs/vibrport-crash2.log`), so the first boot re-checks that.
+2. **Census.** One instrumented 90 s world run, background apps closed. G1-G5 and the R5 counters go into a table here. Each gate's verdict decides whether its step below is built, changed or dropped. This costs a day and can prove a pillar wrong before it is written.
+3. **`cta-mem`, ring transport** (`CTA_MEM=1`). One home in 2 MiB sections, with the VRAM-cache and GPU-owned tiers. The cloned translator emits block read and write sets instead of per-range refreshes. No in place yet.
+4. **Content-keyed shader cache, journal prebuild, stand-ins.**
+   - **Checkpoint M.** Steps 3 and 4 make the minimum win. Run, then compare with the bar. If it misses, the census says why (R1, R2 or R4) before anything novel is built.
+5. **In-place tier and opened windows** (`CTA_INPLACE=1`), A/B against the ring (R5, R6).
+6. **Chunk workers on the E-cores and the slim submit lane** (`CTA_STREAM=1`). Goal: submit under 5 ms.
+7. **Chunk reuse with check mode** (`CTA_REUSE=1`), only if G2 passed.
+8. **GPU detile and lazy copy-back** (`CTA_GPUDETILE=1`, `CTA_LAZYBACK=1`), shaped by G5. Goal: copy-back under 3 ms, and no texture staging in RAM.
+
+**Targets.**
+- Bar (checkpoint M): 20 fps stable, commit under 14 GB, VRAM under 7 GB.
+- Stretch (after step 8): 30 fps, submit under 5 ms, worker translation under 15 ms in parallel, uploads under 4 ms.
+
+## 7. What is new here, honestly
 - **Placement per block, from use, with migration**, for a console's shared memory: not found in any emulator. The closest prior art is NVIDIA's UVM access counters, which work on GPU reads only and inside the driver.
 - **Replaying translated command chunks, keyed on their inputs:** not found. Dolphin's display-list cache keyed on content alone and was removed.
 - **A VRAM "before" image plus a compute copy-back into the opened home:** a variant of AnyPS5's changed-bytes rule, without RAM twins.
 - **GPU detiling:** done by Xenia, not by any GTA VI runtime.
 - **Not new:** the home sections, opened heaps, write watch, stand-ins, the journal and direct DXIL. Those are cloned, with credit.
-
-## 6. Risks
-- Opened heaps are "diagnostics only" per Microsoft, and there is no NVIDIA performance data. Step 0 decides, and copy fallbacks keep every tier working.
-- A chunk reused with a missed input draws a stale frame. The check mode is always on in debug runs.
-- Lazy copy-back puts a GPU round trip on a CPU fault. Blocks read every frame go eager, so steady-state faults stay rare.
-- 16 GB RAM: the title alone may need most of it. Cold home pages paging out is the release valve, so watch hard faults in the feed.
+- **The minimum win needs none of the new parts.** That is deliberate: the new parts are upside, not the foundation.
