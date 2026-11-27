@@ -19,6 +19,13 @@ The game already boots, loads and draws the 3D world under several runtimes. Wha
 - But that memory sits in system RAM, so every GPU access crosses PCIe, plus two dependent map loads. The result is 200-400 ms world frames, and five-star's own roadmap says "game memory in video memory".
 - AnyPS5 measured the same thing on NVIDIA: draws took 164 ms reading in place against 45 ms with copies.
 
+**On our rig** (VI-BR-PORT `2954325`, the author's 8 GB preset, 150 s, `6ixlaunch/runs/vibrport-base-165723.log`):
+- Menus and loading screens ran at 30 fps, with 9.7 GB private before the world.
+- The world collapsed to 0.0-0.3 fps, up to 28 s a frame. Private was 15.4 GB, free RAM 0.3-1 GB, and the overlay showed 29.5 GB committed.
+- Each frame did 9,042 refreshes, 6.8 GB checked. 5,293 draws were dropped for want of a pipeline, with 2,580 still being made.
+
+So the title itself fits in about 10 GB. The other ~5.7 GB, plus the pipelines it never had time to build, is the runtime's own overhead.
+
 **The bus is not the limit.** On the 4090 run, 87 MB goes up and 30 MB comes back a frame, about 3.5 GB/s at 30 fps, against ~13 GB/s usable on x8. The limits are three things:
 1. Duplicated memory, which takes RAM.
 2. Bookkeeping that scales with memory size, not with what changed.
@@ -116,8 +123,28 @@ Other facts that bound the design (measured by their authors):
   - the 2 MiB map cost
 - **Proof:** every change is a 1 s replay A/B, then one 90 s run at 1080p.
 
+## Step 0 results (`cta-probe 256` on the rig, driver as installed)
+
+| Test | Result |
+|---|---|
+| `EXISTING_HEAPS`, GPU upload heaps (ReBAR) | both supported |
+| `OpenExistingHeapFromFileMapping`, `SEC_COMMIT` | ok: 17 ms per 256 MB. A `SEC_RESERVE` section is refused |
+| CPU and GPU see each other's writes in the opened home | yes, both ways, through views and after a view is remapped |
+| View made read-only while its section heap is open | **works**, so guards stay possible. `FromAddress` blocks it, so it's not used |
+| Opening a 256 MB section | +256 MB working set and +256 MB of the card's **non-local budget (7,437 MB)** |
+| Copy speed: upload heap / opened home -> card / card -> home | 12.5 / 12.2 / 13.0 GB/s. The home is as fast a copy source as a staging heap, so no staging is needed |
+| Shader reads, 256 MB read once: VRAM / home / today's shared copy | 247 / 11.9 / 11.6 GB/s |
+| Shader reads, 16 MB read 16 times: VRAM / home / shared | 1,405 / 134 / 176 GB/s |
+| Mapping 512 MB in 64 KiB / 2 MiB views | 5.4 + 8.8 ms / 0.2 + 0.3 ms (same ~0.75 µs per view; 32x fewer views) |
+
+**What this changes:**
+- **The in-place tier is real.** Data read once costs the same in place as a copy (~12 GB/s either way), with no second copy in RAM.
+- **Hot data must be in VRAM.** Repeated reads are 10x faster there (1,405 vs 134 GB/s). The tiers in 2.1 stand.
+- **The whole home cannot stay open.** Each opened byte counts against the 7.4 GB non-local budget and the working set. The home is opened in 64-256 MB windows on demand, LRU, under that budget (AnyPS5 import windows, five-star `--section-heap-budget`). Blocks outside an open window are copied to VRAM instead of read in place.
+- **2 MiB sections are confirmed.**
+
 ## 4. Build order (strangler: the game keeps booting at every step)
-0. **Probe.** Its numbers set the in-place read limit, the window size and the budgets. If `FromFileMapping` or protection on opened views fails on this driver, the in-place tier falls back to a copy from a staging pool, and everything else still holds.
+0. **Probe.** Done, results above. Its numbers set the in-place read limit, the window size and the budgets. If `FromFileMapping` or protection on opened views fails on this driver, the in-place tier falls back to a copy from a staging pool, and everything else still holds.
 1. **Clone and boot.** VI-BR-PORT (edsuuu, victory-fork lineage, GPL-3.0) copied whole into crates/apps with credit and renamed `cta-*`. Boot to the world at 1080p, Series S profile. This is the baseline. Add `cta-feed`.
    - **Why this base:** it has the best result on an 8 GB card, 24.0 fps on a scripted prison walk on an RTX 4060 Ti 8 GB at 1080p. Vice-Tay's 21.1 fps needs a 4090.
    - **Caveat:** that author had 64 GB of RAM. Every 16 GB rig in the catalog stays under 8 fps (M1LK, ruff-lab, CCS03), so RAM, not the base, is our wall. An earlier VI-BR-PORT pin crashed in `victory-image` on this rig (`6ixlaunch/runs/vibrport-crash2.log`), so the first boot re-checks that.
