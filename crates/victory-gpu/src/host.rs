@@ -6896,9 +6896,6 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        if cta_mem::enabled() {
-            cta_mem::live::gpu_read(address as u64, len as u64);
-        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -6916,9 +6913,6 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        if cta_mem::enabled() {
-            cta_mem::live::gpu_write(address as u64, len as u64);
-        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if !declare_writes_once() || deferred.gpu_written.insert(key) {
@@ -7223,6 +7217,10 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
+                    if cta_mem::enabled() {
+                        // Once per range per submission, not per draw.
+                        cta_mem::live::gpu_write(*address as u64, *len as u64);
+                    }
                     let gpu_write = crate::copyprof::start();
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
@@ -7541,6 +7539,9 @@ impl Batch {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
+        if cta_mem::enabled() {
+            cta_mem::live::gpu_read(from as u64, (to - from) as u64);
+        }
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
@@ -7606,6 +7607,10 @@ impl Batch {
     fn flush(&mut self) {
         self.check_textures();
         self.index.clear();
+        if cta_mem::enabled() {
+            // The submission's read set: one merged span per copy.
+            cta_mem::live::gpu_reads(self.refreshes.iter().map(|r| (r.1 as u64, (r.2 - r.1) as u64)));
+        }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;

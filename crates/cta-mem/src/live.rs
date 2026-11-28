@@ -66,6 +66,19 @@ pub fn gpu_read(at: u64, len: u64) {
     }
 }
 
+/// A submission's read set, under one lock.
+pub fn gpu_reads(spans: impl Iterator<Item = (u64, u64)>) {
+    let mut l = live();
+    for (at, len) in spans {
+        l.read_blocks += count(at, len);
+        let stale = l.blocks.gpu_read(at, len);
+        l.stale_reads += stale.len() as u64;
+        for b in stale {
+            l.blocks.uploaded(b);
+        }
+    }
+}
+
 /// A submission's shaders write `[at, at + len)` of title memory.
 pub fn gpu_write(at: u64, len: u64) {
     let mut l = live();
