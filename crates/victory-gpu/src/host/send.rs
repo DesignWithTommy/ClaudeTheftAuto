@@ -234,11 +234,14 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let mut copies = Vec::with_capacity(dirty.len());
     // The pieces of work: the copy's CPU side, the ranges, and where their
     // pairs begin in the memory (which is made once its size is known).
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    // (A titled copy's CPU side is the title's pages, CTA's home or lean
+    // card: read as title memory is, a page that is not there as zeros.)
+    let mut work: Vec<(usize, &[(usize, usize)], usize, bool)> = Vec::new();
     for (shadow, ranges) in dirty {
         let (copy, pieces) = laid_out(ranges, &mut at);
         let from = shadow.card_data() as usize;
-        work.extend(pieces.into_iter().map(|(ranges, to)| (from, ranges, to)));
+        let titled = shadow.titled();
+        work.extend(pieces.into_iter().map(|(ranges, to)| (from, ranges, to, titled)));
         copies.push(copy);
     }
     if at == 0 {
@@ -246,15 +249,29 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(copies.iter().map(|c| c.runs.len()).sum());
+    let mut titled: Vec<(usize, usize, usize)> = Vec::new();
     for ((shadow, _), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
-        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        let into = if shadow.titled() { &mut titled } else { &mut moves };
+        into.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
     }
     let base = memory.data;
     let one = |i: usize| {
-        let (from, ranges, to) = work[i];
+        let (from, ranges, to, titled) = work[i];
         let mut to = (base + to) as *mut [u32; 2];
+        let mut read = [0u8; SHORT];
         for &(a, b) in ranges.iter().filter(|r| short(r.0, r.1 - r.0)) {
+            if titled {
+                crate::host::copy_mapped(read.as_mut_ptr(), (from + a) as *const u8, b - a, false);
+                for (k, word) in read[..b - a].chunks_exact(4).enumerate() {
+                    // SAFETY: inside the memory, as below.
+                    unsafe {
+                        to.write([(a + k * 4) as u32, u32::from_le_bytes([word[0], word[1], word[2], word[3]])]);
+                        to = to.add(1);
+                    }
+                }
+                continue;
+            }
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
@@ -269,10 +286,14 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         }
     };
     crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+    STATS[0].fetch_add(moves.iter().chain(&titled).map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    STATS[1].fetch_add((moves.len() + titled.len()) as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
     crate::shadow::copy_all(moves);
+    crate::land::each_under(titled.len(), &|i: usize| {
+        let (from, into, n) = titled[i];
+        crate::host::copy_mapped(into as *mut u8, from as *const u8, n, false);
+    });
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
 }

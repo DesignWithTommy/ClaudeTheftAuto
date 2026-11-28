@@ -5999,7 +5999,7 @@ impl Host {
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
+                            if let Some((Some(staging), _, _)) = side {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
@@ -6012,7 +6012,9 @@ impl Host {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
-                        if own.is_none() && up.is_none() {
+                        // (A lean card has no CPU side to copy from: its
+                        // bytes go only through the submission's own memory.)
+                        if own.is_none() && up.is_none() && let Some(staging) = staging {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
@@ -10544,6 +10546,12 @@ fn copy_raw_spans(dst: usize, src: usize, len: usize) -> [std::ops::Range<usize>
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+/// Whether card copies' bytes go up through each submission's own memory
+/// (`send::own`): CTA's lean card needs it, having no CPU side of its own.
+pub(crate) fn sends_own() -> bool {
+    send::own()
+}
+
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {

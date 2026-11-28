@@ -472,6 +472,17 @@ pub(crate) struct Shadow {
     /// watch tells it) goes up from there, and what the card wrote lands
     /// there.
     home: Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>,
+    /// CTA's lean card (`crate::home::lean_for`): a copy in the card's
+    /// memory with no CPU side of its own at all. `data` is the title's
+    /// address, and nothing beside the card's buffer is made.
+    lean: bool,
+    /// Of a copy whose CPU side is the title's pages (`home` or `lean`):
+    /// a hash of each 64 bytes of the copy as the card's side last took
+    /// them (0: not known), in place of a RAM copy to compare with (an
+    /// eighth of its size). Prior art: Vilocity's compat sparse windows
+    /// (`hle/d3d12x/sparse.rs`, GPL-3.0) find what changed in write-watched
+    /// title memory by 64-byte hashes the same way.
+    sums: Option<Box<[AtomicU64]>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -479,8 +490,10 @@ pub(crate) struct Shadow {
 struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// the card's side before the next submission. None for CTA's lean
+    /// card: what changed goes up from the title's pages through the
+    /// submission's own memory (`crate::host::send`).
+    staging: Option<ID3D12Resource>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -1094,7 +1107,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
-    all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
+    all.retain(|s| s.place.is_none() && !s.titled() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
     let turn = all.partition_point(|s| s.id < next);
@@ -2157,6 +2170,21 @@ mod difference_tests {
 
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
+
+/// The bytes of a copy one hash of a titled copy's `sums` covers.
+const CHUNK: usize = 64;
+
+/// A titled copy's hash of a chunk's bytes (`crate::reuse::hash`'s mix over
+/// its dwords pairs); never 0, which `sums` keeps for "not known".
+fn chunk_sum(bytes: &[u8]) -> u64 {
+    let mut words = [0u64; CHUNK / 8];
+    for (i, b) in bytes.chunks(8).enumerate() {
+        let mut w = [0u8; 8];
+        w[..b.len()].copy_from_slice(b);
+        words[i] = u64::from_le_bytes(w);
+    }
+    crate::reuse::hash(&words[..bytes.len().div_ceil(8)]) | 1
+}
 
 /// Calls `f` with `[from, to)` cut at multiples of [`PIECE`].
 fn for_pieces_of(from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
@@ -4080,6 +4108,8 @@ impl Shadow {
             mapped: false,
             place: None,
             home: None,
+            lean: false,
+            sums: None,
         }
     }
 
@@ -4768,6 +4798,11 @@ impl Shadow {
             let _compared = Compared(t);
             MERGED[0].fetch_add(1, Ordering::Relaxed);
             let at = lo - self.start as usize;
+            if self.titled() {
+                // The CPU's side is the title's pages: the chunks whose
+                // hash changed.
+                return Ok(Some(self.titled_runs(at, at + n, false).into_iter().map(|(x, y)| (x - at, y - at)).collect()));
+            }
             // SAFETY: the caller's.
             let held = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
             if self.card.is_some() {
@@ -4960,7 +4995,7 @@ impl Shadow {
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) || self.titled() {
             return;
         }
         const SAMPLE: usize = 256;
@@ -5155,8 +5190,8 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        if self.home.is_some() {
-            return self.home_changed(from, to);
+        if self.titled() {
+            return self.titled_take(from, to, false);
         }
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
@@ -5202,26 +5237,112 @@ impl Shadow {
         to - from
     }
 
-    /// CTA's home: title memory `[from, to)`, cut to the buffer, changed:
-    /// the CPU side is the title's pages, so nothing is copied; the range
-    /// goes to the card's side before the next submission.
-    fn home_changed(&self, from: usize, to: usize) -> usize {
+    /// Whether the copy's CPU side is the title's own pages (CTA's home or
+    /// lean card): `data` is the title's address, and `sums` stands in for
+    /// the bytes a RAM side held.
+    pub(crate) fn titled(&self) -> bool {
+        self.sums.is_some()
+    }
+
+    /// Of a [`Shadow::titled`] copy: title memory `[from, to)`, cut to the
+    /// buffer, may have changed. The 64-byte chunks of the copy whose hash
+    /// is not the one the card's side took go to it before the next
+    /// submission, and the hashes take the new; all of them with `force`.
+    /// A chunk only partly in the range goes, that part, whatever its hash,
+    /// which is left as it was (the rest of it is not looked at here).
+    fn titled_take(&self, from: usize, to: usize, force: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (a, b) = (from.max(start), to.min(end));
         if a < b {
-            self.changed(a - start, b - start);
-            self.card_changed(a - start, b - start);
+            let runs = self.titled_runs(a - start, b - start, force);
+            if keeps() {
+                for &(x, y) in &runs {
+                    self.changed(x, y);
+                }
+            }
+            let sent: usize = runs.iter().map(|r| r.1 - r.0).sum();
+            self.card_changed_runs(runs.into_iter());
             SEND[0].fetch_add((b - a) as u64, Ordering::Relaxed);
-            SEND[2].fetch_add((b - a) as u64, Ordering::Relaxed);
+            if sent == 0 {
+                SEND[1].fetch_add((b - a) as u64, Ordering::Relaxed);
+            }
+            SEND[2].fetch_add(sent as u64, Ordering::Relaxed);
             SEND[3].fetch_add(1, Ordering::Relaxed);
         }
         to - from
     }
 
+    /// [`Shadow::titled_take`]'s runs: offsets `[from, to)` of the copy
+    /// (inside it), as runs of offsets whose chunks changed.
+    fn titled_runs(&self, from: usize, to: usize, force: bool) -> Vec<(usize, usize)> {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let Some(sums) = &self.sums else {
+            return vec![(from, to)];
+        };
+        let len = self.len as usize;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut push = |x: usize, y: usize| match runs.last_mut() {
+            Some(last) if last.1 == x => last.1 = y,
+            _ => runs.push((x, y)),
+        };
+        TITLE.with_borrow_mut(|title| {
+            let mut at = from - from % CHUNK;
+            while at < to {
+                // A page of chunks at a time.
+                let upto = (at + PAGE).min(to.next_multiple_of(CHUNK)).min(len.next_multiple_of(CHUNK));
+                let n = upto.min(len) - at;
+                title.resize(n, 0);
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), (self.start as usize + at) as *const u8, n, false);
+                let mut c = at;
+                while c < upto {
+                    let (x, y) = (c.max(from), (c + CHUNK).min(to).min(len));
+                    let whole = x == c && y == (c + CHUNK).min(len);
+                    if !whole {
+                        push(x, y);
+                    } else {
+                        let h = chunk_sum(&title[c - at..y - at]);
+                        if sums[c / CHUNK].swap(h, Ordering::Relaxed) != h || force {
+                            push(x, y);
+                        }
+                    }
+                    c += CHUNK;
+                }
+                at = upto;
+            }
+        });
+        runs
+    }
+
+    /// Of a [`Shadow::titled`] copy: the chunks' hashes of `bytes`, which
+    /// are the copy's from offset `at` on, in whole chunks but for the
+    /// copy's last.
+    fn titled_sums(&self, at: usize, bytes: &[u8]) -> Vec<u64> {
+        let len = self.len as usize;
+        (0..bytes.len().div_ceil(CHUNK)).map(|i| chunk_sum(&bytes[i * CHUNK..((i + 1) * CHUNK).min(bytes.len()).min(len - at)])).collect()
+    }
+
+    /// Of a [`Shadow::titled`] copy, after a landing of offsets from `at`
+    /// on: each chunk whose hash was `was` before it and is `now` after it
+    /// takes `now` if the card's side held it as it was (the title had not
+    /// changed it since it went up); else it goes up when next looked at.
+    fn titled_landed(&self, at: usize, was: &[u64], now: &[u64]) {
+        let Some(sums) = &self.sums else {
+            return;
+        };
+        for (i, (w, n)) in was.iter().zip(now).enumerate() {
+            if let Some(sum) = sums.get(at / CHUNK + i) {
+                let _ = sum.compare_exchange(*w, *n, Ordering::Relaxed, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
-        if self.home.is_some() {
-            return self.home_changed(from, to);
+        if self.titled() {
+            return self.titled_take(from, to, true);
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
@@ -5306,7 +5427,17 @@ impl Shadow {
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
-        if self.card.is_some() {
+        if let Some(sums) = &self.sums {
+            // The CPU's side is the title's pages, which hold them: the
+            // chunks wholly inside take their hashes.
+            let len = self.len as usize;
+            let mut c = from.next_multiple_of(CHUNK);
+            while c < to && (c + CHUNK <= to || to == len) {
+                let y = (c + CHUNK).min(to);
+                sums[c / CHUNK].store(chunk_sum(&bytes[c - from..y - from]), Ordering::Relaxed);
+                c += CHUNK;
+            }
+        } else if self.card.is_some() {
             // SAFETY: inside the mapping of the CPU's side, in a range no
             // refresh writes; the lock keeps the landing out.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
@@ -5329,6 +5460,11 @@ impl Shadow {
         if self.card.is_none() || at >= to {
             return Vec::new();
         }
+        if self.titled() {
+            let mut held = vec![0; to - at];
+            crate::host::copy_mapped(held.as_mut_ptr(), (self.start as usize + at) as *const u8, to - at, false);
+            return held;
+        }
         // SAFETY: inside the mapping; the caller holds the submission lock,
         // under which it is written but for what is being landed.
         unsafe { std::slice::from_raw_parts(self.data.add(at).cast_const(), to - at) }.to_vec()
@@ -5347,10 +5483,10 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((card.staging.as_ref(), before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -5469,9 +5605,18 @@ impl Shadow {
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
         }
-        // SAFETY: inside the mapping (checked above); only the submitting
-        // thread writes it.
-        let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        // A titled copy's CPU side is the title's pages: read into one of
+        // ours, so that the merge has them as they are now to go by.
+        let mut side = Vec::new();
+        let old: &mut [u8] = if self.titled() {
+            side.resize(gpu.len(), 0);
+            crate::host::copy_mapped(side.as_mut_ptr(), (start + at) as *const u8, gpu.len(), false);
+            &mut side
+        } else {
+            // SAFETY: inside the mapping (checked above); only the
+            // submitting thread writes it.
+            unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) }
+        };
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
@@ -5539,7 +5684,14 @@ impl Shadow {
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let mut side = Vec::new();
+        let held: &mut [u8] = if self.titled() {
+            side.resize(gpu.len(), 0);
+            crate::host::copy_mapped(side.as_mut_ptr(), (start + at) as *const u8, gpu.len(), false);
+            &mut side
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) }
+        };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
@@ -5591,7 +5743,7 @@ impl Shadow {
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
             shadow.card = Some(Card {
-                staging: none(),
+                staging: Some(none()),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 has_dirty: AtomicBool::new(false),
@@ -5671,6 +5823,10 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
+        thread_local! {
+            /// A titled copy's title bytes, as the merge goes by them.
+            static BASE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
@@ -5710,15 +5866,28 @@ impl Shadow {
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
-            // CTA's home: the CPU side is the title's pages, which the write
-            // watch keeps read-only; writing them there faults, and the fault
-            // counts as a title write that sends the range up again next
-            // frame. Through our own view of the same pages instead.
-            let held = match self.home {
-                Some(_) => crate::inplace::beside(self.start as usize + lo, hi - lo).map_or_else(|| unsafe { self.data.add(lo) }, |b| b as *mut u8),
-                None => unsafe { self.data.add(lo) },
+            // A titled copy (CTA's home or lean card): its CPU side is the
+            // title's pages. They are read into one of ours as they are now,
+            // and the merge goes by that (the title's view of them, or ours
+            // beside it, as `land::piece` finds, takes the card's bytes);
+            // the chunks' hashes take the result where the card's side held
+            // the chunk as it was.
+            let merged = if self.titled() {
+                BASE.with_borrow_mut(|base| {
+                    let (la, ha) = (lo - lo % CHUNK, hi.next_multiple_of(CHUNK).min(self.len as usize));
+                    base.resize(ha - la, 0);
+                    crate::host::copy_mapped(base.as_mut_ptr(), (self.start as usize + la) as *const u8, ha - la, false);
+                    let was = self.titled_sums(la, base);
+                    // SAFETY: as below, `held` being ours.
+                    let merged = unsafe {
+                        crate::land::piece(self.start as usize + lo, now as *const u8, base.as_mut_ptr().add(lo - la), parts, true, notes, self)
+                    };
+                    self.titled_landed(la, &was, &self.titled_sums(la, base));
+                    merged
+                })
+            } else {
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), parts, true, notes, self) }
             };
-            let merged = unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, held, parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
@@ -5795,7 +5964,7 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
-            staging: buffer,
+            staging: Some(buffer),
             before: Mutex::default(),
             dirty: Mutex::default(),
             has_dirty: AtomicBool::new(false),
@@ -6217,14 +6386,32 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         // CTA's home: a big one's CPU side is the title's own pages.
         let homed = if big { crate::home::stage_for(key.0, len) } else { None };
-        let (buffer, data) = match &homed {
-            Some(placed) => (placed.buffer.clone(), key.0 as *mut u8),
-            None => host()?.title_shared_buffer(size)?,
+        // CTA's lean card: no CPU side at all, where the home has none to
+        // give (`crate::home::lean_for`).
+        let lean = big && homed.is_none() && crate::home::lean_for(key.0, len);
+        let (buffer, mut data) = match &homed {
+            Some(placed) => (Some(placed.buffer.clone()), key.0 as *mut u8),
+            None if lean => (None, key.0 as *mut u8),
+            None => {
+                let (buffer, data) = host()?.title_shared_buffer(size)?;
+                (Some(buffer), data)
+            }
         };
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        if let Some(buffer) = &buffer {
+            crate::host::name(buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        }
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
         let (buffer, card) = match card_for(size) {
+            None if buffer.is_none() => {
+                // No room on the card: a copy in the PC's memory after all.
+                crate::home::unlean(len);
+                let (buffer, at) = host()?.title_shared_buffer(size)?;
+                data = at;
+                crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                (buffer, None)
+            }
+            None => (buffer?, None),
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -6243,7 +6430,6 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 };
                 (on_card, Some(card))
             }
-            None => (buffer, None),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6271,7 +6457,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         };
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.lean = lean && shadow.card.is_some();
         shadow.home = homed.map(|p| p.heap);
+        if shadow.lean || shadow.home.is_some() {
+            shadow.sums = Some((0..(len as usize).div_ceil(CHUNK)).map(|_| AtomicU64::new(0)).collect());
+        }
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -6475,7 +6665,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
-        staging,
+        staging: Some(staging),
         before: Mutex::default(),
         dirty: Mutex::default(),
         has_dirty: AtomicBool::new(false),
@@ -6553,7 +6743,7 @@ fn build_loose_shadow(start: u64, len: u64, backing: LooseBacking) -> Arc<Shadow
                 Some(on_card) => {
                     crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
                     let card = Card {
-                        staging: buffer,
+                        staging: Some(buffer),
                         before: Mutex::default(),
                         dirty: Mutex::default(),
                         has_dirty: AtomicBool::new(false),

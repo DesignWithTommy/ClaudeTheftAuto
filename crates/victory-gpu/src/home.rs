@@ -51,7 +51,9 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Since the start: regions, their bytes, buffers and windows placed, their
 /// bytes; refused: not one stretch and not private, not committed, by the
 /// host; regions forgotten.
-static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Then card copies fed from the title's pages, their bytes; lean card
+/// copies (no CPU side at all), their bytes.
+static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 /// Why windows and buffers were refused, by how the views cover them:
 /// none (and not private memory whole), holes, scattered, a run the host
 /// refused; then, of "none", private memory partly committed or of
@@ -133,6 +135,31 @@ pub(crate) fn stage_for(start: u64, len: u64) -> Option<Placed> {
     STATS[8].fetch_add(1, Ordering::Relaxed);
     STATS[9].fetch_add(len, Ordering::Relaxed);
     Some(placed)
+}
+
+/// CTA's lean card, for a big title buffer [`stage_for`] found no place
+/// for: whether its copy in the card's memory is to have no CPU side at
+/// all. Its CPU side is then the title's own memory, whoever's pages they
+/// are, read where it is (a page not there reads as zeros); what changed
+/// in it is found by the hashes of its 64-byte chunks and goes up through
+/// each submission's own memory (`crate::host::sends_own`). Vice-Tay's
+/// card copy kept a RAM copy of the whole buffer to compare with and to
+/// send from. `CTA_LEAN=0` keeps that.
+pub(crate) fn lean_for(start: u64, len: u64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| on() && std::env::var_os("CTA_LEAN").is_none_or(|v| v != "0") && crate::host::sends_own());
+    if !on || len == 0 || !crate::texture::committed(start as *const u8, len as usize) {
+        return false;
+    }
+    STATS[10].fetch_add(1, Ordering::Relaxed);
+    STATS[11].fetch_add(len, Ordering::Relaxed);
+    true
+}
+
+/// A [`lean_for`] that found no room on the card.
+pub(crate) fn unlean(len: u64) {
+    STATS[10].fetch_sub(1, Ordering::Relaxed);
+    STATS[11].fetch_sub(len, Ordering::Relaxed);
 }
 
 /// A [`stage_for`] that went in place whole instead (no room on the card).
@@ -243,8 +270,8 @@ pub(crate) fn log() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         target: "cta_mem",
-        "cta home: {} buffers and windows in place ({} MB, no host copy) over {} regions ({} MB opened); refused {}: {} not committed, {} by the host; {} regions forgotten; {} card copies fed from the title's pages ({} MB, no RAM copy)",
-        s[2], s[3] >> 20, s[0], s[1] >> 20, s[4], s[5], s[6], s[7], s[8], s[9] >> 20,
+        "cta home: {} buffers and windows in place ({} MB, no host copy) over {} regions ({} MB opened); refused {}: {} not committed, {} by the host; {} regions forgotten; {} card copies fed from the title's pages ({} MB, no RAM copy); {} lean card copies ({} MB, no CPU side)",
+        s[2], s[3] >> 20, s[0], s[1] >> 20, s[4], s[5], s[6], s[7], s[8], s[9] >> 20, s[10], s[11] >> 20,
     );
     let w: Vec<u64> = WHY.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
