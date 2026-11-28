@@ -6896,6 +6896,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        if cta_mem::enabled() {
+            cta_mem::live::gpu_read(address as u64, len as u64);
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -6913,6 +6916,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        if cta_mem::enabled() {
+            cta_mem::live::gpu_write(address as u64, len as u64);
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if !declare_writes_once() || deferred.gpu_written.insert(key) {

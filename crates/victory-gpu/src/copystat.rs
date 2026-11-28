@@ -1110,6 +1110,9 @@ pub(crate) fn present_begins() {
 /// A frame was presented.
 pub(crate) fn presented() {
     add(C::Frames, 1);
+    if cta_mem::enabled() {
+        cta_mem::live::frame();
+    }
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
     SUBMITTED_SINCE.store(false, Relaxed);

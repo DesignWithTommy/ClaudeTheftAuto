@@ -110,6 +110,11 @@ impl Blocks {
         self.map.get(&(at / BLOCK * BLOCK))
     }
 
+    /// Every block's tier.
+    pub fn tiers(&self) -> impl Iterator<Item = Tier> + '_ {
+        self.map.values().map(|b| b.tier)
+    }
+
     pub fn on_card(&self) -> u64 {
         self.on_card
     }

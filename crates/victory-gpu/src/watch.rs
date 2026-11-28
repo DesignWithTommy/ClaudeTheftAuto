@@ -273,6 +273,9 @@ pub(crate) fn wrote(at: usize, len: usize) {
     let now = j.asked;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
+            if cta_mem::enabled() {
+                cta_mem::live::cpu_write((page * PAGE) as u64, PAGE as u64);
+            }
     }
 }
 
@@ -338,6 +341,9 @@ fn note_kernel_writes(j: &mut Journal, count: usize, now: u64) {
         let page = address / PAGE;
         if previous != Some(page) {
             j.written.insert(page, now);
+            if cta_mem::enabled() {
+                cta_mem::live::cpu_write((page * PAGE) as u64, PAGE as u64);
+            }
             previous = Some(page);
         }
     }
@@ -483,6 +489,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let kernel = guarded.is_empty() && !failed;
     for page in guarded {
         j.written.insert(page, now);
+            if cta_mem::enabled() {
+                cta_mem::live::cpu_write((page * PAGE) as u64, PAGE as u64);
+            }
     }
     // An ahead asking stands ([`ask_ahead`], [`ask_once`]): the range was
     // just scanned, so the window's other copies of these pages answer from

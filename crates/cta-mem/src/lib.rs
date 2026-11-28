@@ -10,6 +10,7 @@
 
 pub mod blocks;
 pub mod home;
+pub mod live;
 pub mod ring;
 
 /// Bytes in a block: the title's page size, and the unit of placement.

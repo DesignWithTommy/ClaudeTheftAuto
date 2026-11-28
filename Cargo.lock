@@ -172,6 +172,9 @@ dependencies = [
 [[package]]
 name = "cta-mem"
 version = "0.1.0"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "cta-probe"
@@ -709,6 +712,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "cta-mem",
  "tempfile",
  "tracing",
  "victory-formats",
