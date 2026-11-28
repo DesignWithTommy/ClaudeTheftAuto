@@ -466,6 +466,12 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// CTA's home (`crate::home::stage_for`): of a copy in the card's
+    /// memory, its CPU side is the title's own pages, in a heap opened on
+    /// them, kept here. No RAM copy: what the title wrote (as the write
+    /// watch tells it) goes up from there, and what the card wrote lands
+    /// there.
+    home: Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -4073,6 +4079,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            home: None,
         }
     }
 
@@ -5148,6 +5155,9 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        if self.home.is_some() {
+            return self.home_changed(from, to);
+        }
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
@@ -5192,8 +5202,27 @@ impl Shadow {
         to - from
     }
 
+    /// CTA's home: title memory `[from, to)`, cut to the buffer, changed:
+    /// the CPU side is the title's pages, so nothing is copied; the range
+    /// goes to the card's side before the next submission.
+    fn home_changed(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (a, b) = (from.max(start), to.min(end));
+        if a < b {
+            self.changed(a - start, b - start);
+            self.card_changed(a - start, b - start);
+            SEND[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+            SEND[2].fetch_add((b - a) as u64, Ordering::Relaxed);
+            SEND[3].fetch_add(1, Ordering::Relaxed);
+        }
+        to - from
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
+        if self.home.is_some() {
+            return self.home_changed(from, to);
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
@@ -6179,7 +6208,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.title_shared_buffer(size)?;
+        // CTA's home: a big one's CPU side is the title's own pages.
+        let homed = if big { crate::home::stage_for(key.0, len) } else { None };
+        let (buffer, data) = match &homed {
+            Some(placed) => (placed.buffer.clone(), key.0 as *mut u8),
+            None => host()?.title_shared_buffer(size)?,
+        };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
@@ -6219,8 +6253,18 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
+        // No room on the card: the home's pages are the buffer itself.
+        let homed = match homed {
+            Some(placed) if card.is_none() => {
+                crate::home::unstage(len);
+                entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+                return entry.shadow.clone();
+            }
+            homed => homed,
+        };
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.home = homed.map(|p| p.heap);
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));

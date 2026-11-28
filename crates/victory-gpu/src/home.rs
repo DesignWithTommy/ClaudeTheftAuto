@@ -51,7 +51,7 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Since the start: regions, their bytes, buffers and windows placed, their
 /// bytes; refused: not one stretch and not private, not committed, by the
 /// host; regions forgotten.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// Title memory `[start, start + len)` as the title's own pages, or `None`
 /// for the caller's copy.
@@ -79,6 +79,41 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
     }
     placed
+}
+
+/// The CPU side of a big buffer's copy in the card's memory as the title's
+/// own pages (`crate::shadow` `lookup`): a buffer over title memory
+/// `[start, start + len)` from its first byte (`start` on a 64 KiB line),
+/// or `None` for a copy in the PC's memory as before. Nothing goes up from
+/// a RAM copy: the ranges the title wrote are copied from these pages to
+/// the card's side, and what the card wrote lands in them.
+///
+/// Prior art: Vilocity's `compat` sparse windows (voidopcode/vilocity,
+/// GPL-3.0, `hle/d3d12x/sparse.rs`) keep the CPU's view as the title's
+/// memory and send only what it wrote to VRAM; this does the same for
+/// Vice-Tay's card copies.
+pub(crate) fn stage_for(start: u64, len: u64) -> Option<Placed> {
+    if !on() || len == 0 || start % K64 != 0 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let placed = match place_in(&host.device, start, len) {
+        Ok(p) => Some(p),
+        Err(4) => crate::inplace::place_part(&host.device, start, len).ok(),
+        Err(_) => None,
+    }
+    .filter(|p| p.bias == 0)?;
+    STATS[8].fetch_add(1, Ordering::Relaxed);
+    STATS[9].fetch_add(len, Ordering::Relaxed);
+    Some(placed)
+}
+
+/// A [`stage_for`] that went in place whole instead (no room on the card).
+pub(crate) fn unstage(len: u64) {
+    STATS[8].fetch_sub(1, Ordering::Relaxed);
+    STATS[9].fetch_sub(len, Ordering::Relaxed);
+    STATS[2].fetch_add(1, Ordering::Relaxed);
+    STATS[3].fetch_add(len, Ordering::Relaxed);
 }
 
 /// `Err(4)`: not one stretch of a section; 5 not committed; 6 refused.
@@ -181,7 +216,7 @@ pub(crate) fn log() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         target: "cta_mem",
-        "cta home: {} buffers and windows in place ({} MB, no host copy) over {} regions ({} MB opened); refused {}: {} not committed, {} by the host; {} regions forgotten",
-        s[2], s[3] >> 20, s[0], s[1] >> 20, s[4], s[5], s[6], s[7],
+        "cta home: {} buffers and windows in place ({} MB, no host copy) over {} regions ({} MB opened); refused {}: {} not committed, {} by the host; {} regions forgotten; {} card copies fed from the title's pages ({} MB, no RAM copy)",
+        s[2], s[3] >> 20, s[0], s[1] >> 20, s[4], s[5], s[6], s[7], s[8], s[9] >> 20,
     );
 }
