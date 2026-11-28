@@ -222,6 +222,13 @@ Either one means this PC caps the game, not the translator.
 - Bar (checkpoint M): 20 fps stable, commit under 14 GB, VRAM under 7 GB.
 - Stretch (after step 8): 30 fps, submit under 5 ms, worker translation under 15 ms in parallel, uploads under 4 ms.
 
+### Order changed: the new parts first
+The base moved from M1LK to Vice-Tay pieces (PIECES.md), and patching it (home.rs, step 3) took the world from 1.7 to 3-4 fps. But it stays capped by Vice-Tay's design: about 14 GB private and RAM paging at 48k faults/s. CTA's own core is now built before any more patches:
+
+- **A. Chunk replay (`cta-replay`, `CTA_REUSE=1`), was step 7.** Hash each title list's stream with its bound state. On a hit, re-execute last frame's closed host lists and keep only the refreshes their read sets need; on a miss, translate as now. Check mode compares a sample of hits against a fresh translation.
+- **B. Run record (`cta-record`), new.** At exit, write which blocks were hot or cold, which pipelines were drawn, and each list's hit rate. At boot, place blocks and prebuild pipelines from it, so frame one starts where the last run ended.
+- **C. Block tiers from the read and write sets (step 3 proper).** The sets the replay layer already keeps drive in place, VRAM, GPU-owned or cold per 64 KiB block, which replaces the per-buffer RAM copies that hold the 14 GB.
+
 ## 7. What is new here, honestly
 - **Placement per block, from use, with migration**, for a console's shared memory: not found in any emulator. The closest prior art is NVIDIA's UVM access counters, which work on GPU reads only and inside the driver.
 - **Replaying translated command chunks, keyed on their inputs:** not found. Dolphin's display-list cache keyed on content alone and was removed.

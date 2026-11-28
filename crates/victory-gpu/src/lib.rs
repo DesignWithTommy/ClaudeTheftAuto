@@ -59,6 +59,7 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod home;
+mod reuse;
 mod inplace;
 #[cfg(windows)]
 mod port;

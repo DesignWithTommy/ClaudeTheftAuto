@@ -66,6 +66,8 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// CTA's replay census: the list's pieces' keys folded (`crate::reuse`).
+    sum: u64,
 }
 
 impl Drop for Front {
@@ -92,6 +94,7 @@ impl Front {
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        self.sum = 0;
         self.put(RESET, &[pipeline as u64]);
     }
 
@@ -135,6 +138,7 @@ impl Front {
         if self.words.is_empty() {
             return;
         }
+        self.sum = crate::reuse::fold(self.sum, crate::reuse::piece(&self.words));
         let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
         let words = std::mem::replace(&mut self.words, fresh);
         CHUNKS.fetch_add(1, Relaxed);
@@ -156,6 +160,9 @@ impl Front {
         self.put(CLOSE, &[]);
         self.closed = true;
         self.hand_over();
+        if self.recording.is_some() {
+            crate::reuse::list(self.sum);
+        }
     }
 }
 

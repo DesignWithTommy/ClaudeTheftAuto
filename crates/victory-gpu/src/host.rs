@@ -5241,6 +5241,7 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     crate::port::log(frames);
     crate::home::log();
+    crate::reuse::log(frames as u64);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
@@ -11134,6 +11135,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        crate::reuse::frame();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
