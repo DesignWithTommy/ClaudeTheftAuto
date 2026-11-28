@@ -5710,8 +5710,15 @@ impl Shadow {
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
-            let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), parts, true, notes, self) };
+            // CTA's home: the CPU side is the title's pages, which the write
+            // watch keeps read-only; writing them there faults, and the fault
+            // counts as a title write that sends the range up again next
+            // frame. Through our own view of the same pages instead.
+            let held = match self.home {
+                Some(_) => crate::inplace::beside(self.start as usize + lo, hi - lo).map_or_else(|| unsafe { self.data.add(lo) }, |b| b as *mut u8),
+                None => unsafe { self.data.add(lo) },
+            };
+            let merged = unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, held, parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
