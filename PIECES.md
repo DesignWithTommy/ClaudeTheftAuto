@@ -16,6 +16,7 @@ test run through i95 at 1920x1080 must beat the old piece on the rig (RTX
 |---|---|---|---|---|
 | `apps/cta/src/main.rs` | front end: `run`, `shaders`, `warm` only | **ours** | | |
 | `crates/cta-mem` | one home for title memory, 64 KiB block tiers, upload ring (PLAN.md 2.1) | **ours** | | |
+| `crates/victory-gpu/src/home.rs` | the home: title buffers and windows read in place from the title's own pages, no host copy in the PC's memory (`CTA_MEM=1`) | **ours** (heap opening cloned from Vice-Tay port 1) | | |
 | `crates/cta-probe` | step 0 driver probe | **ours** (inplace.rs from VI-BR-PORT) | | |
 | `apps/cta/src/run.rs` | start the title: map, bind, run | Vice-Tay 3e3fd57 | Vice-Tay with preset_4060 was the best on the rig (~16 fps first room) | |
 | `apps/cta/src/warm.rs` | pipeline prebuild workers | Vice-Tay 3e3fd57 | same | VIctory-NVIDIA warm, five-star |

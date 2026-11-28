@@ -6166,6 +6166,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && (size >= card_limits().0 || card_all());
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
+        // CTA's home: the title's own pages, no host copy (`crate::home`).
+        if !big && let Some(placed) = crate::home::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -6600,7 +6605,7 @@ fn loose_with(
         };
         // Keep the original transaction for optional imported/placed memory.
         // The outside-lock path below only manufactures independent backing.
-        if crate::port::on() || crate::inplace::level() >= 1 {
+        if crate::home::on() || crate::port::on() || crate::inplace::level() >= 1 {
             let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
             let (start, len) = loose_key_with(&map, cell, named, q);
             if let Some(shadow) = map.get(&(start, len)) {
@@ -6609,7 +6614,7 @@ fn loose_with(
             }
             // In place, if asked for and the window's memory can be opened: the
             // window is the title's own memory, with nothing to copy.
-            if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
+            if let Some(placed) = crate::home::place_for(start, len, true).or_else(|| crate::port::place_for(start, len, true)).or_else(|| crate::inplace::place_for(start, len, true)) {
                 let shadow = Arc::new(Shadow::placed(placed, start, len, true));
                 note(&shadow);
                 map.insert((start, len), shadow.clone());
