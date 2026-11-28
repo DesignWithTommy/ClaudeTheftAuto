@@ -95,6 +95,7 @@ fn parse_jobs(value: &str) -> Result<usize, &'static str> {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    find_bcpack_tables();
     let cli = Cli::parse();
     #[cfg(agility_sdk)]
     agility::check_runtime()?;
@@ -108,6 +109,27 @@ fn main() -> Result<()> {
         Command::Warm { jobs, batch_size, normal_priority, limit, again, used, these } => {
             warm::run(jobs, batch_size, normal_priority, limit, again, used, these)
         }
+    }
+}
+
+/// Without the BCPack format tables every compressed texture the title
+/// streams fails and the world draws black. When `VICTORY_BCPACK_TABLES` is
+/// unset, look for `bcpack-tables.bin` beside `cta.exe`, then in
+/// `%LOCALAPPDATA%\6ixpack`, and say plainly when there is none.
+fn find_bcpack_tables() {
+    const VAR: &str = "VICTORY_BCPACK_TABLES";
+    if std::env::var_os(VAR).is_some() {
+        return;
+    }
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("bcpack-tables.bin")));
+    let local = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("6ixpack").join("bcpack-tables.bin"));
+    match beside.into_iter().chain(local).find(|p| p.is_file()) {
+        Some(found) => {
+            tracing::info!(path = %found.display(), "BCPack format tables found");
+            // SAFETY: called first thing in main, before any other thread starts.
+            unsafe { std::env::set_var(VAR, found) };
+        }
+        None => tracing::warn!("no BCPack format tables: compressed textures will fail and the world will draw black; set {VAR}"),
     }
 }
 
