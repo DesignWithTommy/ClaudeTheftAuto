@@ -1,13 +1,11 @@
-//! XStore as an offline console answers it: the game's own licence is
-//! local and active (a full, owned game); the user owns no add-ons; what
-//! needs the store service (catalog, consumables, purchase and update
-//! pages, collection ids, update checks) fails with the documented store
-//! network error.
+//! Offline XStore implementation. Game and package licences are inactive
+//! without verified entitlements. Calls that need the store service fail
+//! with the documented store network error.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
 
-use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL};
+use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL, E_INVALIDARG};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
 };
@@ -48,12 +46,9 @@ pub const NETWORK_ERROR: HRESULT = 0x8924_5301_u32 as i32;
 type This = *const Object;
 type Handle = *const c_void;
 
-/// Contexts and product queries hold nothing (queries are always empty),
-/// so their handles are fixed addresses. A licence handle says whether it
-/// is valid by which address it is.
+/// Contexts, empty product queries and inactive licences have fixed handles.
 static CONTEXT: u8 = 0;
 static QUERY: u8 = 0;
-static VALID: u8 = 0;
 static INVALID: u8 = 0;
 fn handle(of: &'static u8) -> Handle {
     (of as *const u8).cast()
@@ -123,25 +118,21 @@ extern "system" fn next_page_async(_: This, _: Handle, block: *mut AsyncBlock) -
     xasync::finished(block, (&raw const QUERY_CALL).cast(), E_ILLEGAL_METHOD_CALL)
 }
 
-fn license_for(owned: bool, block: *mut AsyncBlock) -> HRESULT {
-    let license = handle(if owned { &VALID } else { &INVALID });
+fn inactive_license(block: *mut AsyncBlock) -> HRESULT {
     xasync::finished_with(
         block,
         (&raw const LICENSE_CALL).cast(),
-        Ok(xasync::bytes(license)),
+        Ok(xasync::bytes(handle(&INVALID))),
     )
 }
-/// Only the game's own package is installed, so only its licence is valid.
 extern "system" fn license_for_package_async(
     _: This,
     _: Handle,
-    package: *const c_char,
+    _: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let ours = text(package).is_some_and(|p| p == xpackage::identifier());
-    license_for(ours, block)
+    inactive_license(block)
 }
-/// The user owns no durables: their licences are not valid.
 extern "system" fn license_for_durables_async(
     _: This,
     _: Handle,
@@ -150,15 +141,15 @@ extern "system" fn license_for_durables_async(
 ) -> HRESULT {
     tracing::debug!(
         store_id = text(store_id).unwrap_or_default(),
-        "durable not owned"
+        "durable entitlement unverified"
     );
-    license_for(false, block)
+    inactive_license(block)
 }
 extern "system" fn license_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
     xasync::result(block, (&raw const LICENSE_CALL).cast(), out)
 }
-extern "system" fn is_license_valid(_: This, license: Handle) -> bool {
-    license == handle(&VALID)
+extern "system" fn is_license_valid(_: This, _: Handle) -> bool {
+    false
 }
 
 /// The game licence, as the public API lays it out.
@@ -175,8 +166,7 @@ pub struct GameLicense {
     pub expiration: i64,
 }
 
-/// A full, active licence for the game's SKU (`<store id>/0010`, the
-/// store's first SKU), not a trial, without expiry.
+/// Report the game's SKU with an inactive licence until ownership can be verified.
 fn game_license() -> GameLicense {
     let mut sku = [0u8; 18];
     let id = format!("{}/0010", runtime::title().store_id);
@@ -184,7 +174,7 @@ fn game_license() -> GameLicense {
     sku[..len].copy_from_slice(&id.as_bytes()[..len]);
     GameLicense {
         sku_store_id: sku,
-        is_active: true,
+        is_active: false,
         is_trial_owned_by_this_user: false,
         is_disc_license: false,
         is_trial: false,
@@ -301,7 +291,8 @@ extern "system" fn install_async(
 }
 
 /// The game's own store id maps to its installation; nothing else is
-/// installed.
+/// installed, and any other id gets the documented E_INVALIDARG (not
+/// XPackage's "could not resolve" error).
 extern "system" fn package_identifier(
     _: This,
     store_id: *const c_char,
@@ -313,7 +304,7 @@ extern "system" fn package_identifier(
         Some(id) if !title.store_id.is_empty() && id == title.store_id => {
             put_string(&xpackage::identifier(), size, buffer, std::ptr::null_mut())
         }
-        _ => xpackage::NO_PACKAGE,
+        _ => E_INVALIDARG,
     }
 }
 
@@ -332,7 +323,7 @@ extern "system" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> b
     true
 }
 
-static VTABLE: Methods<76> = Methods([
+static VTABLE: Methods<77> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -367,9 +358,9 @@ static VTABLE: Methods<76> = Methods([
     missing::<31> as *const (),              // 0xf8
     missing::<32> as *const (),              // 0x100
     consumable_balance_async as *const (),   // 0x108
-    status as *const (),                     // 0x110
+    count_status as *const (),               // 0x110
     report_fulfillment_async as *const (),   // 0x118
-    missing::<36> as *const (),              // 0x120
+    count_status as *const (),               // 0x120
     user_id_async as *const (),              // 0x128 collections id
     size_status as *const (),                // 0x130
     string_status as *const (),              // 0x138
@@ -383,11 +374,11 @@ static VTABLE: Methods<76> = Methods([
     missing::<47> as *const (),              // 0x178
     missing::<48> as *const (),              // 0x180
     purchase_ui_async as *const (),          // 0x188
-    missing::<50> as *const (),              // 0x190
+    status as *const (),                     // 0x190
     missing::<51> as *const (),              // 0x198 rate and review
     missing::<52> as *const (),              // 0x1a0
     redeem_ui_async as *const (),            // 0x1a8
-    missing::<54> as *const (),              // 0x1b0
+    status as *const (),                     // 0x1b0
     updates_async as *const (),              // 0x1b8
     count_status as *const (),               // 0x1c0
     array_status as *const (),               // 0x1c8
@@ -409,6 +400,7 @@ static VTABLE: Methods<76> = Methods([
     missing::<73> as *const (),              // 0x248 associated products page
     missing::<74> as *const (),              // 0x250
     product_page_ui_async as *const (),      // 0x258
+    status as *const (),                     // 0x260
 ]);
 
 #[cfg(test)]
@@ -426,7 +418,134 @@ mod tests {
     }
 
     #[test]
-    fn the_game_is_licensed_and_the_store_is_offline() {
+    fn offline_async_calls_report_network_error_from_their_result_slots() {
+        assert!(VTABLE.0.len() > 0x260 / 8);
+
+        let this: This = &OBJECT;
+        type StoreIdAsync =
+            extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type ReportFulfillmentAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type PurchaseUiAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type RedeemUiAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const *const c_char,
+            usize,
+            bool,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type StatusResult = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type CountResult = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+
+        let mut b = block();
+        assert_eq!(
+            method::<StoreIdAsync>(&OBJECT, 0x258)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x260)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        let mut remaining = 7u32;
+        assert_eq!(
+            method::<ReportFulfillmentAsync>(&OBJECT, 0x118)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                1,
+                std::ptr::null(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<CountResult>(&OBJECT, 0x120)(this, &mut b, &mut remaining),
+            NETWORK_ERROR
+        );
+        assert_eq!(remaining, 7);
+
+        let mut b = block();
+        assert_eq!(
+            method::<PurchaseUiAsync>(&OBJECT, 0x188)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x190)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        assert_eq!(
+            method::<RedeemUiAsync>(&OBJECT, 0x1a8)(
+                this,
+                handle(&CONTEXT),
+                c"DUMMY-TOKEN".as_ptr(),
+                std::ptr::null(),
+                0,
+                false,
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x1b0)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        let mut balance = 3u32;
+        assert_eq!(
+            method::<StoreIdAsync>(&OBJECT, 0x108)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<CountResult>(&OBJECT, 0x110)(this, &mut b, &mut balance),
+            NETWORK_ERROR
+        );
+        assert_eq!(balance, 3);
+    }
+
+    #[test]
+    fn unverified_game_and_package_licences_are_inactive() {
         let this: This = &OBJECT;
         assert_eq!(size_of::<GameLicense>(), 104);
         type Begin = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
@@ -444,7 +563,7 @@ mod tests {
         );
         // SAFETY: written by the call.
         let license = unsafe { license.assume_init() };
-        assert!(license.is_active && !license.is_trial);
+        assert!(!license.is_active);
 
         let mut b = block();
         assert_eq!(
@@ -458,22 +577,38 @@ mod tests {
             NETWORK_ERROR
         );
 
-        type Durable = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type AcquireLicense =
+            extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
         type License = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
-        let mut b = block();
-        let durable = method::<Durable>(&OBJECT, 0x238);
+        let package = std::ffi::CString::new(xpackage::identifier()).unwrap();
+        let is_valid = method::<extern "system" fn(This, Handle) -> bool>(&OBJECT, 0xb0);
+        for (begin, result, identifier) in
+            [(0xa0, 0xa8, package.as_c_str()), (0x238, 0x240, c"9XYZ")]
+        {
+            let mut b = block();
+            let acquire = method::<AcquireLicense>(&OBJECT, begin);
+            assert_eq!(
+                acquire(this, handle(&CONTEXT), identifier.as_ptr(), &mut b),
+                S_OK
+            );
+            assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+            let mut license = std::ptr::null();
+            assert_eq!(
+                method::<License>(&OBJECT, result)(this, &mut b, &mut license),
+                S_OK
+            );
+            assert!(!is_valid(this, license));
+        }
+    }
+
+    #[test]
+    fn a_store_id_without_a_package_is_an_invalid_argument() {
+        type Query = extern "system" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
+        let query = method::<Query>(&OBJECT, 0x208);
+        let mut id = [0u8; 33];
         assert_eq!(
-            durable(this, handle(&CONTEXT), c"9XYZ".as_ptr(), &mut b),
-            S_OK
+            query(&OBJECT, c"9NOTINSTALLED".as_ptr(), 33, id.as_mut_ptr()),
+            E_INVALIDARG
         );
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
-        let mut l = std::ptr::null();
-        assert_eq!(
-            method::<License>(&OBJECT, 0x240)(this, &mut b, &mut l),
-            S_OK
-        );
-        assert!(!method::<extern "system" fn(This, Handle) -> bool>(
-            &OBJECT, 0xb0
-        )(this, l));
     }
 }

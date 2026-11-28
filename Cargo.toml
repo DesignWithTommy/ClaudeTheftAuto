@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*", "xtask"]
+members = ["crates/*", "apps/*"]
 # Fixtures are standalone crates built on demand by integration tests.
 exclude = ["tests/fixtures"]
 
@@ -38,6 +38,7 @@ windows = "0.62.2"
 windows-core = "0.62.2"
 blake3 = "1.8.7"
 memchr = "2.8.3"
+mimalloc = { version = "0.1.52", default-features = false }
 # SIMD-accelerated pure-Rust zlib/deflate (Zlib license, runtime AVX2/SSE4.2 dispatch).
 zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
 walkdir = "2.5.1"
@@ -48,8 +49,6 @@ opus-pure = "0.2.4"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
-# m1lk_external_tables: CI builds that must not carry the BCPack format tables (see bcpack.rs)
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(m1lk_external_tables)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

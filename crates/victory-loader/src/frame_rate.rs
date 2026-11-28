@@ -1,8 +1,8 @@
 //! The title's frame rate (`VICTORY_FRAME_INTERVAL_MS`, off without it): the
-//! rate the title asks for is a setting of its own, and two
+//! rate Grand Theft Auto VI asks for is a setting of its own, and two
 //! places in its code are changed at load to read another.
 //!
-//! What the title does (the title's executable, image offsets):
+//! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
 //!
 //! - Its graphics settings hold a frame rate (+0x210 of the settings object,
 //!   30 on Series X). Two functions that apply the settings, +0x1e0fb30 and
@@ -48,7 +48,7 @@ pub fn asked_interval_ms() -> Option<f64> {
     let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
     let ms = parse_interval_ms(&spec);
     if ms.is_none() {
-        eprintln!("VIctory: M1LK_FRAME_INTERVAL_MS={spec}: expected milliseconds from 0 (no wait) to 1000");
+        eprintln!("VIctory: VICTORY_FRAME_INTERVAL_MS={spec}: expected milliseconds from 0 (no wait) to 1000");
     }
     ms
 }
@@ -109,7 +109,7 @@ pub enum Kind {
     SimRate,
 }
 
-/// The three reads (the title's executable, image offsets).
+/// The three reads (game_scarlett_master.exe 1.0.2.1, image offsets).
 pub const SITES: [Site; 3] = [
     // +0x1e0fb30: mov eax, [rdi+210h] ... mov [+0x98f84ac], eax
     Site {
@@ -215,7 +215,7 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
             })();
             let offset = format_args!("{:#x}", site.at);
             match done {
-                Patched::Done => tracing::info!(site = %offset, kind = ?site.kind, rate, "frame rate: the title's read of its frame rate setting patched (M1LK_FRAME_INTERVAL_MS)"),
+                Patched::Done => tracing::info!(site = %offset, kind = ?site.kind, rate, "frame rate: the title's read of its frame rate setting patched (VICTORY_FRAME_INTERVAL_MS)"),
                 Patched::Differs => tracing::warn!(site = %offset, "frame rate: not patched, the title's bytes there are not the ones expected (another build?)"),
                 Patched::Failed(why) => tracing::warn!(site = %offset, why, "frame rate: not patched"),
             }

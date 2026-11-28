@@ -1,10 +1,10 @@
 //! The title's output size and render scale (`VICTORY_OUTPUT`,
-//! `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each off
+//! `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE`, `VICTORY_UPSCALER`; each off
 //! without it): places
 //! in the title's code changed at load, each compared byte for byte first
 //! and left alone, said so, if it differs (another build of the title).
 //!
-//! What the title does (the title's executable, image offsets):
+//! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
 //!
 //! - **Output size.** Its settings (`settings.xml` in its storage,
 //!   `video/resolutionFullscreen`, 3840x2160 as a Series X wrote it; read
@@ -30,12 +30,20 @@
 //!   its own (+0x7e9440) multiplies by a scale at +0x90 of it, set to 2/3 at
 //!   +0x28f1e78 (so 2560x1440 for 4K, 1280x720 for 1080p);
 //!   `VICTORY_RENDER_SCALE` replaces that constant (Series X; run res-4 at
-//!   1.0). FidelityFX's own scale (+0x28ef680) is deliberately not switchable: a patch of it
-//!   (VICTORY_FFX_SCALE in cool_fox) divided by a zero jitter phase count at 0.5.
+//!   1.0). FidelityFX's (+0x28ef680, Series S) multiplies by 1.0 on Series X,
+//!   2/3 on Series S; `VICTORY_FFX_SCALE` points its two loads at a constant
+//!   in its padding (as pull request #53 did). That one is not safe: at 0.5
+//!   on Series S (run res-6) FidelityFX's jitter phase count came back 0 and
+//!   the title divided by it (+0x28f03e8) 49 s in.
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
 
 use crate::frame_rate::Patched;
+
+#[cfg(any(windows, test))]
+mod ui_plane;
+#[cfg(any(windows, test))]
+mod viewbox;
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
@@ -46,7 +54,7 @@ pub fn asked_output() -> Option<(u32, u32)> {
     let spec = std::env::var("VICTORY_OUTPUT").ok()?;
     let size = parse_output(&spec);
     if size.is_none() {
-        eprintln!("VIctory: M1LK_OUTPUT={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160");
+        eprintln!("VIctory: VICTORY_OUTPUT={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160");
     }
     size
 }
@@ -66,7 +74,7 @@ pub fn asked_render_scale() -> Option<f32> {
     let spec = std::env::var("VICTORY_RENDER_SCALE").ok()?;
     let scale = parse_render_scale(&spec);
     if scale.is_none() {
-        eprintln!("VIctory: M1LK_RENDER_SCALE={spec}: expected 0.5 to 1.0");
+        eprintln!("VIctory: VICTORY_RENDER_SCALE={spec}: expected 0.5 to 1.0");
     }
     scale
 }
@@ -75,12 +83,23 @@ pub fn parse_render_scale(spec: &str) -> Option<f32> {
     spec.trim().parse::<f32>().ok().filter(|s| (0.5..=1.0).contains(s))
 }
 
+/// `VICTORY_FFX_SCALE=<s>`, 0.5 to 1.0: FidelityFX's render scale (Series
+/// S). Crashed at 0.5 (run res-6); see the module's notes.
+pub fn asked_ffx_scale() -> Option<f32> {
+    let spec = std::env::var("VICTORY_FFX_SCALE").ok()?;
+    let scale = parse_render_scale(&spec);
+    if scale.is_none() {
+        eprintln!("VIctory: VICTORY_FFX_SCALE={spec}: expected 0.5 to 1.0");
+    }
+    scale
+}
+
 /// `VICTORY_UPSCALER=<kind>`: 6 (the title's own) or 7 (FidelityFX).
 pub fn asked_upscaler() -> Option<u32> {
     let spec = std::env::var("VICTORY_UPSCALER").ok()?;
     let kind = spec.trim().parse::<u32>().ok().filter(|k| matches!(k, 6 | 7));
     if kind.is_none() {
-        eprintln!("VIctory: M1LK_UPSCALER={spec}: expected 6 (the title's own) or 7 (FidelityFX)");
+        eprintln!("VIctory: VICTORY_UPSCALER={spec}: expected 6 (the title's own) or 7 (FidelityFX)");
     }
     kind
 }
@@ -145,6 +164,22 @@ pub const OWN_SCALE: Site = Site {
     bytes: &[0xc7, 0x81, 0x90, 0x00, 0x00, 0x00, 0xab, 0xaa, 0x2a, 0x3f],
 };
 
+/// FidelityFX's render size method, +0x28ef680, and its padding: the scale
+/// is 1.0 (+0x5fc6ed8) or, on Series S, 2/3 (+0x615d95c), loaded at +0x28
+/// and +0x32.
+pub const FFX_SCALE: Site = Site {
+    at: 0x28ef680,
+    what: "FidelityFX's render scale",
+    bytes: &[
+        0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x83, 0xec, 0x28, 0x44, 0x89, 0xcb, 0x4c, 0x89, 0xc6, 0x48, 0x89, 0xd7, 0x49, 0x89,
+        0xce, 0xe8, 0xa6, 0x5a, 0x78, 0xfd, 0x0f, 0xb6, 0xc0, 0x41, 0x89, 0x86, 0x90, 0x00, 0x00, 0x00, 0x84, 0xc0, 0x75, 0x0a,
+        0xc5, 0xfa, 0x10, 0x05, 0x28, 0x78, 0x6d, 0x03, 0xeb, 0x08, 0xc5, 0xfa, 0x10, 0x05, 0xa2, 0xe2, 0x86, 0x03, 0xc5, 0xf2,
+        0x2a, 0x54, 0x24, 0x70, 0xc5, 0xf2, 0x2a, 0xcb, 0xc5, 0xfa, 0x59, 0xc9, 0xc5, 0xfa, 0x2c, 0xc1, 0x89, 0x07, 0xc5, 0xfa,
+        0x59, 0xc2, 0xc5, 0xfa, 0x2c, 0xc0, 0x89, 0x06, 0x48, 0x83, 0xc4, 0x28, 0x5b, 0x5f, 0x5e, 0x41, 0x5e, 0xc3, 0xcc, 0xcc,
+        0xcc, 0xcc, 0xcc, 0xcc,
+    ],
+};
+
 /// The upscaler picker, +0x7e93f0, to its first `ret`.
 pub const PICKER: Site = Site {
     at: 0x7e93f0,
@@ -190,6 +225,19 @@ pub fn output_code(width: u32, height: u32) -> Vec<u8> {
 pub fn own_scale_code(scale: f32) -> Vec<u8> {
     let mut c = OWN_SCALE.bytes[..6].to_vec();
     c.extend(scale.to_le_bytes());
+    c
+}
+
+/// What goes at [`FFX_SCALE`] for `scale`: both loads read `scale`, written
+/// into the padding at +0x64.
+pub fn ffx_scale_code(scale: f32) -> Vec<u8> {
+    const LOADS: [usize; 2] = [0x28, 0x32];
+    const SLOT: usize = 0x64;
+    let mut c = FFX_SCALE.bytes.to_vec();
+    c[SLOT..SLOT + 4].copy_from_slice(&scale.to_le_bytes());
+    for l in LOADS {
+        c[l + 4..l + 8].copy_from_slice(&((SLOT - (l + 8)) as i32).to_le_bytes());
+    }
     c
 }
 
@@ -256,13 +304,39 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 pub unsafe fn apply_asked(base: usize, size: usize) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
-        asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
-        if (w, h) != (3840, 2160) {
-            asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+        let split_code = ui_plane::requested(
+            (w, h),
+            std::env::var_os("VICTORY_UI_PLANE").as_deref(),
+            std::env::var_os("VICTORY_UI_PLANE_720").as_deref(),
+            std::env::var_os("VICTORY_PLANES").as_deref(),
+        )
+        .then(|| ui_plane::output_code(w, h))
+        .flatten()
+        .filter(|_| unsafe {
+            [&OUTPUT, &POOL_CHECK, &ui_plane::POOL]
+                .iter()
+                .all(|site| matches(base, size, site) == Patched::Done)
+        });
+        if let Some(code) = split_code {
+            let value = format!("{w}x{h} scene, 3840x2160 interface");
+            asked.push((&POOL_CHECK, pool_check_code(), value.clone()));
+            asked.push((&ui_plane::POOL, ui_plane::SPLIT_POOL.to_vec(), value.clone()));
+            asked.push((&OUTPUT, code, value));
+        } else {
+            asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+            if (w, h) != (3840, 2160) {
+                asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+            }
+            if viewbox::requested((w, h), std::env::var_os("VICTORY_UI_VIEWBOX").as_deref()) {
+                asked.push((&viewbox::SITE, viewbox::FITTED.to_vec(), format!("{w}x{h}")));
+            }
         }
     }
     if let Some(s) = asked_render_scale() {
         asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+    }
+    if let Some(s) = asked_ffx_scale() {
+        asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
     }
     if let Some(kind) = asked_upscaler() {
         asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
@@ -344,6 +418,17 @@ mod tests {
         assert_eq!(own[..6], OWN_SCALE.bytes[..6]);
         assert_eq!(own[6..], 0.5f32.to_le_bytes());
         assert_eq!(OWN_SCALE.bytes[6..], (2.0f32 / 3.0).to_le_bytes());
+        let ffx = ffx_scale_code(0.75);
+        assert_eq!(ffx.len(), FFX_SCALE.bytes.len());
+        assert_eq!(ffx[0x64..0x68], 0.75f32.to_le_bytes());
+        for at in [0x28, 0x32] {
+            assert_eq!(ffx[at..at + 4], [0xc5, 0xfa, 0x10, 0x05], "vmovss xmm0, [rip+d]");
+            let disp = i32::from_le_bytes(ffx[at + 4..at + 8].try_into().unwrap());
+            assert_eq!(at as i32 + 8 + disp, 0x64);
+        }
+        // Only the two displacements and the padding change.
+        let changed: Vec<usize> = (0..ffx.len()).filter(|&i| ffx[i] != FFX_SCALE.bytes[i]).collect();
+        assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
     }

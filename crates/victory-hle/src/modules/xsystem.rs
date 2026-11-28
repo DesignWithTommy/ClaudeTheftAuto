@@ -14,7 +14,7 @@ pub const PROVIDER: Guid = Guid::new(
     [0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f],
 );
 
-/// The interface as a 2022 title asks for it; an older table
+/// The interface as Minecraft (2022) asks for it; an older table
 /// ended before the device id.
 pub const IID: Guid = Guid::new(
     0x6fd7_1f09,

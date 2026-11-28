@@ -1,4 +1,4 @@
-//! Exercise FidelityFX 4 Quality through the retail title's descriptions and
+//! Exercise the selected FidelityFX upscaler through the title's descriptions and
 //! console objects, then read back the upscaled colour. Requires a host
 //! GPU and `VICTORY_FIDELITYFX_DIR`.
 #![cfg(windows)]
@@ -157,7 +157,7 @@ fn half(bits: u16) -> f32 {
 #[test]
 fn the_titles_upscaler_runs_on_the_host() {
     let Some(dir) = std::env::var_os("VICTORY_FIDELITYFX_DIR") else {
-        eprintln!("M1LK_FIDELITYFX_DIR not set; skipped");
+        eprintln!("VICTORY_FIDELITYFX_DIR not set; skipped");
         return;
     };
     // The debug layer, before anything makes the host device: it checks
@@ -169,7 +169,8 @@ fn the_titles_upscaler_runs_on_the_host() {
             debug.iter().for_each(|d| d.EnableDebugLayer());
         }
     }
-    victory_hle::modules::fidelityfx::use_host_dir(Some(std::path::Path::new(&dir)));
+    let selected =
+        victory_hle::modules::fidelityfx::use_host_dir(std::path::Path::new(&dir)).unwrap();
     let Some(host) = victory_gpu::external::host_device() else {
         panic!("a FidelityFX directory was supplied but no native GPU is available");
     };
@@ -324,17 +325,17 @@ fn the_titles_upscaler_runs_on_the_host() {
         .into_iter()
         .enumerate()
     {
-        let (texture, state) =
-            victory_gpu::external::host_texture(list, resource, RENDER_TARGET).unwrap();
-        assert_eq!(state, RENDER_TARGET);
         let at = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: first.ptr + i * step,
         };
-        // SAFETY: a live texture and our heap; the list is open.
-        unsafe { host.CreateRenderTargetView(&texture, None, at) };
-        // SAFETY: an open list and the view just made.
-        victory_gpu::external::record(list, |l| unsafe {
-            l.ClearRenderTargetView(at, &value, None)
+        victory_gpu::external::record(list, |l| {
+            let (texture, state) = l.texture(resource, RENDER_TARGET).unwrap();
+            assert_eq!(state, RENDER_TARGET);
+            // SAFETY: our heap, a live texture, and an open list.
+            unsafe {
+                host.CreateRenderTargetView(&texture, None, at);
+                l.commands().ClearRenderTargetView(at, &value, None);
+            }
         })
         .unwrap();
     }
@@ -490,11 +491,35 @@ fn the_titles_upscaler_runs_on_the_host() {
     eprintln!("provider {:#x} {:?}", provider.id, unsafe {
         std::ffi::CStr::from_ptr(provider.name)
     });
-    assert!(
-        unsafe { std::ffi::CStr::from_ptr(provider.name) }
-            .to_bytes()
-            .starts_with(b"4.")
+    let provider_name = unsafe { std::ffi::CStr::from_ptr(provider.name) }.to_string_lossy();
+    assert!(provider_name.trim_start_matches("FSR ").starts_with(selected));
+
+    // A rejected dispatch restores the bindings on this still-open list.
+    let output_resource = upscaling.resources[6];
+    let too_small = at(
+        render,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        target | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
     );
+    for invalid in [
+        described(color, 4, render, 0, 0xc),
+        described(too_small, 4, render, 2, 0x2),
+    ] {
+        upscaling.resources[6] = invalid;
+        assert_eq!(dispatch(&mut context, &mut upscaling.header), 6);
+        victory_gpu::external::record(list, |list| {
+            assert_eq!(
+                list.existing_texture_binding(color).unwrap().1,
+                Some(RENDER_TARGET)
+            );
+            assert_eq!(
+                list.existing_texture_binding(upscaled).unwrap().1,
+                Some(RENDER_TARGET)
+            );
+        })
+        .unwrap();
+    }
+    upscaling.resources[6] = output_resource;
     // Two frames: the first resets the history.
     for reset in [1, 0] {
         upscaling.reset = reset;
@@ -502,9 +527,6 @@ fn the_titles_upscaler_runs_on_the_host() {
     }
 
     // Read the output back in the same list, run it as the title would.
-    let (texture, state) =
-        victory_gpu::external::host_texture(list, upscaled, COPY_SOURCE).unwrap();
-    assert_eq!(state, COPY_SOURCE);
     let (pitch, rows) = (
         u64::from(output[0]).next_multiple_of(32) * 8,
         u64::from(output[1]),
@@ -539,6 +561,8 @@ fn the_titles_upscaler_runs_on_the_host() {
         buffer.unwrap()
     };
     victory_gpu::external::record(list, |l| {
+        let (texture, state) = l.texture(upscaled, COPY_SOURCE).unwrap();
+        assert_eq!(state, COPY_SOURCE);
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: borrowed; the location never releases it.
             pResource: unsafe { std::mem::transmute_copy(&readback) },
@@ -565,7 +589,7 @@ fn the_titles_upscaler_runs_on_the_host() {
             },
         };
         // SAFETY: an open list and live resources.
-        unsafe { l.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        unsafe { l.commands().CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     })
     .unwrap();
     slot::<extern "system" fn(This) -> i32>(list, 0x48)(list);

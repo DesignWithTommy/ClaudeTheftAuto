@@ -1,0 +1,43 @@
+[package]
+name = "cta"
+description = "CTA's front end: run, shaders, warm."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cta-mem.workspace = true
+victory-core.workspace = true
+victory-pe.workspace = true
+victory-loader.workspace = true
+victory-hle.workspace = true
+victory-shader = { workspace = true, features = ["host"] }
+victory-game.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+memchr.workspace = true
+clap.workspace = true
+walkdir.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+# Debug-level logs and the debugging switches (frame capture, stack dumps,
+# the host debug layer, scripted keys). Off in a plain release build.
+diagnostics = [
+    "victory-core/diagnostics",
+    "victory-hle/diagnostics",
+    "victory-loader/diagnostics",
+    "victory-shader/diagnostics",
+]
+mimalloc = ["victory-hle/mimalloc"]
+
+[lints]
+workspace = true

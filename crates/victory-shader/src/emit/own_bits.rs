@@ -674,7 +674,7 @@ impl Ctx<'_> {
                     || name.contains("lane")
                     || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
                     || super::lower::reads_mask_as_data(st, inst)
-                    || self.sections[b].iter().any(|(&s, sec)| i >= s && i < sec.after);
+                    || self.sections[b].iter().any(|(&s, sec)| i >= s && i <= sec.end);
                 if cross {
                     return Err((self.at(u), CROSS));
                 }
@@ -760,7 +760,7 @@ pub(super) fn find(p: &Program, st: &Structured, why: bool) -> OwnBits {
                 };
                 let ctx = ctx.get_or_insert_with(|| Ctx::new(p, st));
                 // (values only the section itself reads are not results)
-                let inside = |u: &User| matches!(*u, User::Inst(b2, i) if b2 == b && sec.holds(s, i));
+                let inside = |u: &User| matches!(*u, User::Inst(b2, i) if b2 == b && i > s && i < sec.end);
                 if ctx.users.get(&t).is_none_or(|us| us.iter().all(inside)) {
                     continue;
                 }

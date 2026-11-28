@@ -15,24 +15,33 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// On Windows with diagnostics, copystat counts allocations and uses this
+// same backend when the feature is enabled.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod lightprobe;
+#[cfg(windows)]
+mod texlate;
+#[cfg(windows)]
+mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
 mod compose;
-#[cfg(windows)]
-mod copyprof;
 pub mod console;
-pub mod cores;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod faultbook;
 #[cfg(windows)]
-mod debug_hud;
+mod cores;
 pub mod descriptor;
 pub mod device;
-#[cfg(windows)]
-pub mod dlss;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -41,9 +50,9 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
-mod gpudetile;
-#[cfg(windows)]
-mod heap_worker;
+pub mod framegen;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod book;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -51,69 +60,113 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
-mod lowcommit;
-mod material_demand;
-#[cfg(windows)]
 mod port;
 #[cfg(windows)]
-#[allow(dead_code)]
-mod prof;
+mod port_cbv;
+#[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
+mod port_journal;
+#[cfg(windows)]
+mod land;
+#[cfg(all(test, windows))]
+mod loadprobe;
 pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-mod plaincopy;
+mod picked;
+#[cfg(windows)]
+mod pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod popwatch;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod replay;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod safecopy;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+
+/// What `victory shaders` made of one shader that translates.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Precompiled {
+    /// Its entry was in the cache already.
+    Cached,
+    /// Translated now and written to the cache.
+    Translated,
+    /// Translated, but not on disk: why (a run would translate it again).
+    NotCached(String),
+}
+
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
 mod shadow;
-pub mod signature;
-#[cfg(windows)]
-pub mod upscale;
-#[cfg(windows)]
-mod texture;
-#[cfg(windows)]
-mod wc_back;
-#[cfg(windows)]
-mod lazy;
 #[cfg(windows)]
 mod tiles;
+pub mod signature;
+mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
+#[cfg(windows)]
+mod tdr;
+#[cfg(windows)]
+mod texture;
+pub mod timeline;
+#[cfg(windows)]
+pub mod titlewrite;
+#[cfg(windows)]
+mod upload;
 #[cfg(windows)]
 mod watch;
-#[cfg(windows)]
-mod writeback;
 #[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// The process is ending in an orderly way (the title exits, or its window
+/// was closed): the pictures the capture thread still has in its line
+/// (`VICTORY_CAPTURE`) are written before this returns, or three seconds
+/// have passed, which is logged. Does nothing without diagnostics.
+#[cfg(windows)]
+pub fn finish_captures() {
+    #[cfg(feature = "diagnostics")]
+    capture::finish();
+}
+
+/// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+/// off while the title runs (`ab`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn switched(switch: &str) -> Option<bool> {
+    ab::pick(switch)
+}
+
+/// What the frame is at (`copystat::phase`), for the sampling profiler.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn frame_phase() -> u32 {
+    copystat::phase()
+}
+
 /// Frames the title has begun (its frame waits that ended), for logs.
 pub fn frames_begun() -> u64 {
     frame::current()
 }
 #[cfg(windows)]
-pub use wc_back::title_memory_reserved;
-#[cfg(windows)]
-pub use lazy::{
-    ensure as lazy_ensure, is_lazy as lazy_is_lazy, mark_view as lazy_mark_view, on as lazy_commit_on,
-    section_committed as lazy_section_committed, section_gone as lazy_section_gone, unmark as lazy_unmark,
-};
-#[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_bytes_written, title_memory_reading, title_memory_reading_range, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_range,
-    writing as kernel_will_write,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_placeholder, title_memory_reading,
+    title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    title_memory_written, writing as kernel_will_write,
 };

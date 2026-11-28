@@ -43,7 +43,7 @@ pub const DEVICE_PROVIDER: Guid = Guid::new(
     [0x86, 0xb7, 0x27, 0x37, 0x76, 0x7c, 0x0b, 0xf1],
 );
 
-/// The device interface as a 2022 title asks for it.
+/// The device interface as Minecraft (2022) asks for it.
 pub const DEVICE_IID: Guid = Guid::new(
     0x0cc6_a956,
     0xe7e1,

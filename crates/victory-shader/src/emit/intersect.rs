@@ -46,14 +46,9 @@ enum NodeAt {
     Buffer { handle: V, byte: V },
     /// In title memory: the raw view of the host copy holding the node's
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
-    /// and the node's address, for the second half of a 128-byte node.
-    Memory {
-        handle: V,
-        byte: V,
-        low: V,
-        high: V,
-        mapped: V,
-    },
+    /// the node's address, for the second half of a 128-byte node, and
+    /// whether there is a copy.
+    Memory { handle: V, byte: V, low: V, high: V, mapped: V },
 }
 
 /// The ray operands, as floats.
@@ -62,14 +57,6 @@ struct Ray {
     origin: [V; 3],
     direction: [V; 3],
     inverse: [V; 3],
-}
-
-/// `VICTORY_BVH_MISS=1` (off by default): the node test
-/// misses every node. While the structure builder is off the structures are
-/// never built, and a walk of what lies in their memory is not the console's.
-fn bvh_miss() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
 }
 
 impl<'a> Lower<'a> {
@@ -189,10 +176,6 @@ impl<'a> Lower<'a> {
         };
         let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
-        let probe = crate::emit::RAY_PROBE.get();
-        if probe {
-            self.ray_probe_increment(0, None);
-        }
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
@@ -208,25 +191,11 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        // With `VICTORY_BVH_MISS=1` every node is missed
-        // without being read: a box returns no child and a triangle the
-        // triangle miss, so a walk ends at its first node.
-        let boxes = if bvh_miss() {
-            [self.s.m.i32(bvh::NONE); 4]
-        } else {
-            self.bvh_boxes(at, kind, &ray, sort)
-        };
+        let boxes = self.bvh_boxes(at, kind, &ray, sort);
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
-        let triangle = if bvh_miss() {
-            bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
-        } else {
-            self.bvh_triangle(at, kind, &ray)
-        };
-        if probe {
-            self.ray_probe_triangle(at, [pointer, pointer_high.unwrap_or(zero)], &ray, triangle);
-        }
+        let triangle = self.bvh_triangle(at, kind, &ray);
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
@@ -254,97 +223,6 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// One atomic add per active wave. The first wave to report a hit
-    /// elects its first active lane to record the six sample dwords.
-    fn ray_probe_increment(&mut self, word: u32, sample: Option<[V; 6]>) {
-        let yes = self.s.m.bool(true);
-        let count = self.s.op(
-            self.cur,
-            "waveAllOp",
-            Attr::NoUnwind,
-            self.s.t.i32,
-            135,
-            &[yes],
-        );
-        let first = self.s.op(
-            self.cur,
-            "waveIsFirstLane",
-            Attr::NoUnwind,
-            self.s.t.i1,
-            110,
-            &[],
-        );
-        self.s.flags |= flags::WAVE_OPS;
-        let lane = self.begin_guarded(Some(first));
-        let storage = self.s.root_uav_handle(crate::emit::SLOT_FAULTS);
-        let byte = self.s.m.i32(4 * (crate::emit::MEMORY_FAULTS + word));
-        let add = self.s.m.i32(0);
-        let undef = self.s.m.undef(self.s.t.i32);
-        let previous = self.s.op(
-            self.cur,
-            "atomicBinOp.i32",
-            Attr::NoUnwind,
-            self.s.t.i32,
-            78,
-            &[storage, add, byte, undef, undef, count],
-        );
-        if let Some(fields) = sample {
-            let zero = self.s.m.i32(0);
-            let first = self.s.m.cmp(self.cur, pred::EQ, previous, zero);
-            let elected = self.begin_guarded(Some(first));
-            let mask = self.s.m.i8(1);
-            let align = self.s.m.i32(4);
-            for (i, field) in fields.into_iter().enumerate() {
-                let byte = self
-                    .s
-                    .m
-                    .i32(4 * (crate::emit::MEMORY_FAULTS + 2 + i as u32));
-                self.s.op(
-                    self.cur,
-                    "rawBufferStore.i32",
-                    Attr::NoUnwind,
-                    self.s.t.void,
-                    140,
-                    &[
-                        storage, byte, undef, field, undef, undef, undef, mask, align,
-                    ],
-                );
-            }
-            self.end_guarded(elected, &[]);
-        }
-        self.end_guarded(lane, &[]);
-    }
-
-    /// A geometric candidate exists before the guest chooses its closest
-    /// hit or applies material/alpha tests. Only one lane writes the sample.
-    fn ray_probe_triangle(&mut self, at: NodeAt, pointer: [V; 2], ray: &Ray, result: [V; 4]) {
-        let c = self.cur;
-        let numerator = self.as_float(result[0]);
-        let denominator = self.as_float(result[1]);
-        let distance = self.s.m.bin(c, Bin::SDiv, numerator, denominator);
-        let zero = self.s.m.f32(0);
-        let infinity = self.s.m.f32(f32::INFINITY.to_bits());
-        let forward = self.s.m.cmp(c, pred::OGE, distance, zero);
-        let finite = self.s.m.cmp(c, pred::OLT, distance, infinity);
-        let within = self.s.m.cmp(c, pred::OLE, distance, ray.extent);
-        let valid = self.s.m.bin(c, Bin::And, forward, finite);
-        let mut valid = self.s.m.bin(c, Bin::And, valid, within);
-        if let NodeAt::Memory { mapped, .. } = at {
-            valid = self.s.m.bin(c, Bin::And, valid, mapped);
-        }
-        let hit = self.begin_guarded(Some(valid));
-        let fields = [
-            pointer[0],
-            pointer[1],
-            self.as_int(distance),
-            self.as_int(ray.extent),
-            result[2],
-            result[3],
-        ];
-        self.ray_probe_increment(1, Some(fields));
-        self.end_guarded(hit, &[]);
-    }
-
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
@@ -368,12 +246,13 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at, inside);
         }
-        let (handle, byte, mapped, _) = self.memory(low, high, guard);
+        let (handle, byte) = self.memory(low, high, guard, false);
+        let mapped = self.page_there.expect("memory says");
         (handle, byte, mapped)
     }
 
-    /// The second 64-byte half of a Box32 node can belong to a different
-    /// guest page and a different host buffer.
+    /// The second 64 bytes of a 128-byte node: in a page, and in a copy, of
+    /// their own maybe. Goes on in another block.
     fn bvh_second_half(&mut self, at: NodeAt) -> NodeAt {
         match at {
             NodeAt::Buffer { handle, byte } => {
@@ -383,6 +262,7 @@ impl<'a> Lower<'a> {
             }
             NodeAt::Memory { low, high, .. } => {
                 let (low, high) = self.address_plus(low, high, 64);
+                // Every lane in this block runs the instruction.
                 let (handle, byte, mapped) = self.bvh_memory(low, high, None);
                 NodeAt::Memory {
                     handle,
@@ -395,10 +275,9 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Reads within a single aligned 64-byte part of the node, in groups
-    /// of up to four dwords.
+    /// `count` dwords of 64 bytes of a node from their byte `base` + `offset`
+    /// (`base` computed, `offset` fixed), read four at a time.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let (handle, start_byte) = match at {
             NodeAt::Buffer { handle, byte } | NodeAt::Memory { handle, byte, .. } => (handle, byte),
@@ -408,6 +287,7 @@ impl<'a> Lower<'a> {
             let n = (count - start).min(4);
             let node_byte = offset + 4 * start;
             let mut byte = start_byte;
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -469,6 +349,8 @@ impl<'a> Lower<'a> {
         let second = self.bvh_second_half(at);
         words.extend(self.bvh_node_words(second, None, 0, 12));
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
+        // (The look for the second half goes on in another block.)
+        let wide_block = self.cur;
         self.s.m.terminate(wide_block, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
@@ -493,13 +375,13 @@ impl<'a> Lower<'a> {
         }
         self.s.m.terminate(half_block, Term::Br(join));
         self.cur = join;
-        // All child IDs are in the first part. The last two Box32 bounds
-        // also require the second. A zero returned by a missing page is a
-        // valid child pointer or coordinate, so the slab test alone cannot
-        // distinguish it from real geometry.
-        let residency = match (at, second) {
+        // A page that is not there reads zeros, which are a child and a box:
+        // no child of it is hit. (The last two boxes of a 128-byte node are in
+        // its second half.)
+        let there = match (at, second) {
             (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
-                let mapped = self.s.m.phi(join, self.s.m.type_of(first));
+                let i1t = self.s.m.type_of(first);
+                let mapped = self.s.m.phi(join, i1t);
                 self.s
                     .m
                     .set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
@@ -557,10 +439,10 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
-            let child_present = self.s.m.cmp(c, pred::NE, children[n], none);
-            let hit = self.s.m.bin(c, Bin::And, hit, child_present);
-            let hit = match residency {
-                Some(pages) => self.s.m.bin(c, Bin::And, hit, pages[n]),
+            let child = self.s.m.cmp(c, pred::NE, children[n], none);
+            let hit = self.s.m.bin(c, Bin::And, hit, child);
+            let hit = match there {
+                Some(there) => self.s.m.bin(c, Bin::And, hit, there[n]),
                 None => hit,
             };
             ids[n] = self.s.m.select(c, hit, children[n], none);

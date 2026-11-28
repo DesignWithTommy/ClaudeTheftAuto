@@ -1,6 +1,6 @@
-//! Loose-LDS Wave32 fallback: console wave64 programs that read and write LDS
-//! inside one lane-branch region, run as two host waves of 32 that meet only
-//! where such a region is entered and left (no barriers inside divergent paths).
+//! The loose-LDS fallback (fork PR #799): console wave64 programs that read and
+//! write LDS inside one lane-branch region, run as two host waves of 32 that
+//! meet only where such a region is entered and left.
 
 thread_local! {
     static LDS_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -16,7 +16,7 @@ pub(super) fn on() -> bool {
 /// such a region is entered and left. APPROXIMATE: a value one half writes and
 /// the other half reads inside the region may be read stale. The last resort
 /// for console wave64 programs a 32-lane host would otherwise refuse
-/// (opt-in: `VICTORY_WAVE_LDS_LOOSE=1`).
+/// (`VICTORY_WAVE_LDS_LOOSE=0` turns it off).
 pub(super) fn with<R>(f: impl FnOnce() -> R) -> R {
     let was = LDS_LOOSE.replace(true);
     let r = f();

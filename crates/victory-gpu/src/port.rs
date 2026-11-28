@@ -1,7 +1,7 @@
 //! Renderer port #1: the title's 32-bit graphics heap as the card's own
 //! memory (`VICTORY_PORT_CONSTANTS`, off by default).
 //!
-//! What the title does (the title's executable, the routine at image
+//! What the title does (game_scarlett_master.exe, the routine at image
 //! +0x1e86440, reached at its start): one `XMemVirtualAlloc` of the five
 //! sizes it is given together (kind 0x42000: a reservation of 64 KiB
 //! pages, flags 7: graphics memory below 4 GiB, 185 MB at 0x34310000 in
@@ -71,20 +71,11 @@ const MOST: u64 = 512 << 20;
 /// `VICTORY_PORT_CONSTANTS`: `1` turns renderer port #1 on (title buffers
 /// and windows of title memory in the title's 32-bit graphics memory, view
 /// memory that is one stretch of a section, used in place); unset or
-/// anything else: off, everything as before. Stands down when
-/// `VICTORY_INPLACE_CONSTANTS=1` is on too (`crate::inplace::constants_on`
-/// opens the same pages, and also accounts the flights' writes there).
+/// anything else: off, everything as before.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Read once, here: the switch of renderer port #1.
-    *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1");
-        if on && crate::inplace::constants_on() {
-            tracing::warn!("VICTORY_PORT_CONSTANTS=1 stands down: VICTORY_INPLACE_CONSTANTS=1 places the same memory in place");
-            return false;
-        }
-        on
-    })
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// A stretch of title memory opened as a heap through a view of ours.
@@ -199,9 +190,6 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     if first > at || first + bytes < end || offset % K64 != 0 {
         return Err((3, format!("the stretch {first:#x}+{bytes:#x} does not hold it")));
     }
-    // The heap needs the pages committed; lazy ones are, through the
-    // title's addresses (`VICTORY_LAZY_COMMIT`).
-    crate::lazy::ensure(first as usize, bytes as usize);
     // SAFETY: the section of a view the title has; the runtime keeps its
     // handle open while a view of it is there, and the range is inside it.
     let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;
@@ -304,7 +292,7 @@ pub(crate) fn log(frames: f64) {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "renderer port 1 (M1LK_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
+        "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
          forgotten (other pages mapped there)",
@@ -349,6 +337,7 @@ mod tests {
     /// buffer in the stretch is placed in the same region.
     #[test]
     fn warp_a_stretch_of_a_reserved_section_is_used_in_place_through_a_view_of_ours() {
+        let _turn = crate::indirect::tests::warp_turn();
         let Some(device) = crate::inplace::tests::warp() else { return };
         if windows::core::Interface::cast::<ID3D12Device13>(&device).is_err() {
             return;

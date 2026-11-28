@@ -1,4 +1,4 @@
-//! Shared plumbing for every M1LK crate and tool.
+//! Shared plumbing for every VIctory crate and tool.
 //!
 //! * [`config`]: where the user's files live (never inside the repository).
 //! * [`policy`]: the runtime half of rule #1, refusing to write
@@ -6,7 +6,6 @@
 //! * [`logging`]: one tracing setup for all binaries.
 
 pub mod config;
-pub mod env_alias;
 pub mod logging;
 pub mod policy;
 

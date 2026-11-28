@@ -10,158 +10,8 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 /// `GetModuleHandle(NULL)` and friends to return this, not our own exe.
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
-    if let Some(factor) = std::env::var("VICTORY_POOL_SCALE")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&f| f > 1)
-    {
-        scale_pools(base, factor);
-    }
+    crate::image_watch::start(base);
 }
-
-/// The config lookup pools are sized by (`(table, count, name hash,
-/// default) -> value`) and the pool initialiser (`(pool, slots, slot
-/// bytes)`), as RVAs of image `b99f876b74d4a77f` (title 1.0.2.1).
-const POOL_SIZE_LOOKUP: usize = 0x50C_EF40;
-const POOL_INIT: usize = 0x16C_BE00;
-/// The `building` pool's creation, checked before patching anything: its
-/// first bytes, and its call of the lookup at +0x20.
-const BUILDING_POOL_AT: usize = 0x5AD_8E40;
-const BUILDING_POOL_BYTES: [u8; 9] = [0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x05];
-
-/// The pool slot limit: slot indices are 17 bits, `0x1FFFE` the empty mark.
-const POOL_MOST: u32 = 0x1_FFF0;
-
-static POOL_BASE: AtomicUsize = AtomicUsize::new(0);
-static POOL_FACTOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-static POOLS_SCALED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// The pools [`scale_pools`] makes larger, by config name hash: `building`
-/// (joaat), and `0x0BA88904`, the other pool that runs dry (192-byte
-/// slots; the title's crash report names `INSTANCE_LIST`), and `0xC12C9884`,
-/// the 16-byte list nodes those are linked through, next to fill. Making every
-/// pool larger runs the title out of its memory arena at start.
-const POOLS_TO_SCALE: [u32; 3] = [0x5411_E15C, 0x0BA8_8904, 0xC12C_9884];
-static POOL_HASHES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-
-/// What the title's pool creations call instead of the size lookup
-/// ([`scale_pools`]): the title's own lookup, times the factor for the
-/// pools chosen.
-extern "win64" fn scaled_pool_size(table: u64, count: u32, hash: u32, default: u32) -> u32 {
-    let base = POOL_BASE.load(Ordering::Relaxed);
-    // SAFETY: the title's own lookup at its RVA in the mapped image (checked
-    // in `scale_pools`), called with the arguments it was called with.
-    let lookup: extern "win64" fn(u64, u32, u32, u32) -> u32 =
-        unsafe { std::mem::transmute(base + POOL_SIZE_LOOKUP) };
-    let size = lookup(table, count, hash, default);
-    if !POOL_HASHES.get().is_some_and(|h| h.contains(&hash)) {
-        return size;
-    }
-    POOLS_SCALED.fetch_add(1, Ordering::Relaxed);
-    let factor = POOL_FACTOR.load(Ordering::Relaxed);
-    if size >= POOL_MOST { size } else { size.saturating_mul(factor).min(POOL_MOST) }
-}
-
-/// Diagnostics, `VICTORY_POOL_SCALE=<factor>`: the title pools in
-/// [`POOLS_TO_SCALE`] (or `VICTORY_POOL_SCALE_HASHES=<hex>,...`) are made
-/// `factor` times larger (at most [`POOL_MOST`] slots). The title's
-/// `building` and `INSTANCE_LIST` pools fill about ten minutes in while its
-/// instance culling does not run on hosts of 32-lane waves (upstream issue
-/// #698); larger pools take longer to fill. Each call of the size lookup
-/// followed within 0x60 bytes by a call of the pool initialiser is pointed
-/// at [`scaled_pool_size`] through a jump next to the image (a call reaches
-/// 2 GiB). Only for the image these RVAs were read from: anything else is
-/// left alone.
-/// shortcut: a stopgap; the leak goes on, with more room (more memory).
-fn scale_pools(base: usize, factor: u32) {
-    // SAFETY: the main image is mapped at `base` with its PE headers; its
-    // sections are read, and the call sites' rel32 written with the page
-    // made writable for the write. The jump is our own allocation.
-    unsafe {
-        let at = std::slice::from_raw_parts((base + BUILDING_POOL_AT) as *const u8, 0x30);
-        let call = |o: usize| {
-            (at[o] == 0xE8).then(|| {
-                let rel = i32::from_le_bytes([at[o + 1], at[o + 2], at[o + 3], at[o + 4]]);
-                (base + BUILDING_POOL_AT + o + 5).wrapping_add(rel as isize as usize)
-            })
-        };
-        if at[..9] != BUILDING_POOL_BYTES || call(0x20) != Some(base + POOL_SIZE_LOOKUP) {
-            tracing::warn!("M1LK_POOL_SCALE: not the image it knows; pools left alone");
-            return;
-        }
-        let read32 = |at: usize| (at as *const u32).read_unaligned();
-        let read16 = |at: usize| (at as *const u16).read_unaligned();
-        let nt = base + read32(base + 0x3C) as usize;
-        let image_size = read32(nt + 24 + 56) as usize;
-        let sections = read16(nt + 6) as usize;
-        let table = nt + 24 + read16(nt + 20) as usize;
-        let mut sites = Vec::new();
-        for k in 0..sections {
-            let h = table + 40 * k;
-            let (size, rva, flags) = (read32(h + 8) as usize, read32(h + 12) as usize, read32(h + 36));
-            if flags & 0x2000_0000 == 0 {
-                continue;
-            }
-            let code = std::slice::from_raw_parts((base + rva) as *const u8, size);
-            let target = |i: usize| {
-                let rel = i32::from_le_bytes([code[i + 1], code[i + 2], code[i + 3], code[i + 4]]);
-                (base + rva + i + 5).wrapping_add(rel as isize as usize)
-            };
-            for i in 0..size.saturating_sub(0x70) {
-                if code[i] == 0xE8
-                    && target(i) == base + POOL_SIZE_LOOKUP
-                    && (i + 5..i + 0x60).any(|j| code[j] == 0xE8 && target(j) == base + POOL_INIT)
-                {
-                    sites.push(base + rva + i);
-                }
-            }
-        }
-        // A jump within reach of every call site: just past the image.
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualAlloc,
-            VirtualProtect,
-        };
-        let mut jump = std::ptr::null_mut();
-        for k in 1..64usize {
-            let want = (base + image_size + k * 0x1_0000) & !0xFFFF;
-            jump = VirtualAlloc(want as *const _, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if !jump.is_null() {
-                break;
-            }
-        }
-        if jump.is_null() {
-            tracing::warn!("M1LK_POOL_SCALE: no memory near the image for the jump; pools left alone");
-            return;
-        }
-        // jmp [rip+0]; dq scaled_pool_size
-        let stub: [u8; 6] = [0xFF, 0x25, 0, 0, 0, 0];
-        std::ptr::copy_nonoverlapping(stub.as_ptr(), jump.cast::<u8>(), 6);
-        (jump.cast::<u8>().add(6) as *mut u64).write_unaligned(scaled_pool_size as *const () as usize as u64);
-        let mut old = 0;
-        VirtualProtect(jump, 0x1000, PAGE_EXECUTE_READ, &mut old);
-        POOL_BASE.store(base, Ordering::Relaxed);
-        POOL_FACTOR.store(factor, Ordering::Relaxed);
-        let hashes = std::env::var("VICTORY_POOL_SCALE_HASHES")
-            .ok()
-            .map(|v| v.split(',').filter_map(|h| u32::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect())
-            .unwrap_or_else(|| POOLS_TO_SCALE.to_vec());
-        let _ = POOL_HASHES.set(hashes);
-        let mut patched = 0;
-        for &site in &sites {
-            let rel = (jump as isize - (site as isize + 5)) as i32;
-            if VirtualProtect((site + 1) as *const _, 4, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                ((site + 1) as *mut i32).write_unaligned(rel);
-                VirtualProtect((site + 1) as *const _, 4, old, &mut old);
-                patched += 1;
-            }
-        }
-        use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0);
-        tracing::warn!(factor, sites = sites.len(), patched, hashes = ?POOL_HASHES.get(), "M1LK_POOL_SCALE: pool sizes hooked");
-    }
-}
-
 
 pub fn main_image() -> Option<usize> {
     match MAIN_IMAGE_BASE.load(Ordering::Acquire) {
@@ -204,6 +54,18 @@ pub fn image_named(file: &str) -> Option<usize> {
         .iter()
         .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
         .map(|(b, _)| *b)
+}
+
+static TITLE_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The arguments the title's `main` gets (those after `--`). Set once, before
+/// the title starts; later calls are ignored.
+pub fn set_title_args(args: Vec<String>) {
+    let _ = TITLE_ARGS.set(args);
+}
+
+pub fn title_args() -> &'static [String] {
+    TITLE_ARGS.get().map_or(&[], Vec::as_slice)
 }
 
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
@@ -263,6 +125,32 @@ impl Title {
     }
 }
 
+/// The trimmed text of one element: comments inside it are skipped, not
+/// treated as the end of its value. A manifest generator can write
+/// `<TitleId><!-- generated -->639AA8DD</TitleId>`, which must still give
+/// the title's id rather than an empty field.
+fn field_text(rest: &str) -> String {
+    let mut out = String::new();
+    let mut rest = rest;
+    loop {
+        let Some(open) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if rest[open..].starts_with("<!--") {
+            let Some(end) = rest[open..].find("-->") else {
+                break;
+            };
+            rest = &rest[open + end + 3..];
+        } else {
+            // A child element, a closing tag or anything else ends the text.
+            break;
+        }
+    }
+    out.trim().to_owned()
+}
+
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
 /// decoded; comments, CDATA sections, declarations and attributes are
@@ -278,7 +166,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            rest.find('>').map(|e| e + 1)
+            tag_end(rest)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -299,16 +187,31 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+        let body = field_text(rest);
         let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
             .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+            .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
         }
     }
     out
+}
+
+/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
+/// attribute value is part of the value (XML allows it there unescaped).
+fn tag_end(text: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if c == open => quote = None,
+            (None, '>') => return Some(at + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -336,13 +239,23 @@ pub fn title() -> Title {
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetProcessInformation,
     };
+    // Also: the system does not run this process at reduced speed (its
+    // "efficiency mode": lower clock, the slow cores of a hybrid processor)
+    // when its window is not the one in front, as while its owner works in
+    // another window or streams. The console has eight cores alike and no
+    // such mode. `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
+    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
@@ -355,11 +268,39 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of the title's loading: a
+/// program that keeps the processors busy at normal priority (a build, a
+/// virus scan) starved it, loading took 40 to 60 s instead of 28 to 33, and
+/// the opening ran without the models that were to be there (runs cpu-1,
+/// play-1125-0203). The process runs above normal, as long as it runs.
+/// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quoted_angle_bracket_does_not_end_its_tag() {
+        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
+                    <TitleId>639AA8DD</TitleId>\
+                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 64 << 20));
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {
@@ -373,5 +314,18 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn inline_comments_do_not_truncate_a_field() {
+        let text = "<Game>\
+            <TitleId><!-- generated -->639AA8DD</TitleId>\
+            <StoreId>9&amp;<!-- keep -->C</StoreId>\
+            <PersistentLocalStorage><SizeMB><!-- n -->1024</SizeMB></PersistentLocalStorage>\
+            </Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!(t.id, 0x639A_A8DD);
+        assert_eq!(t.store_id, "9&C");
+        assert_eq!(t.storage_bytes, 1024 << 20);
     }
 }

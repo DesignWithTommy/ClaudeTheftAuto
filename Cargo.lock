@@ -170,6 +170,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cta"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "cta-mem",
+ "memchr",
+ "tempfile",
+ "tracing",
+ "victory-core",
+ "victory-game",
+ "victory-hle",
+ "victory-loader",
+ "victory-pe",
+ "victory-shader",
+ "walkdir",
+ "windows-sys",
+]
+
+[[package]]
 name = "cta-mem"
 version = "0.1.0"
 dependencies = [
@@ -236,19 +257,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hidapi"
-version = "2.6.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "818c0e1d27887aaf76fe737042e27a66b796a7b099e6d2e1a72d106c2dff3fa6"
-dependencies = [
- "cc",
- "cfg-if",
- "libc",
- "pkg-config",
- "windows-sys",
-]
-
-[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -277,6 +285,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -302,6 +319,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "nu-ansi-term"
@@ -344,12 +370,6 @@ name = "pin-project-lite"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
-
-[[package]]
-name = "pkg-config"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "proc-macro2"
@@ -663,25 +683,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "victory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "memchr",
- "tracing",
- "victory-core",
- "victory-formats",
- "victory-game",
- "victory-hle",
- "victory-loader",
- "victory-pe",
- "victory-shader",
- "walkdir",
-]
-
-[[package]]
 name = "victory-core"
 version = "0.1.0"
 dependencies = [
@@ -690,7 +691,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -712,9 +712,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "cta-mem",
+ "mimalloc",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
@@ -727,11 +728,10 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
- "cta-mem",
- "hidapi",
  "opus-pure",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "victory-formats",
  "victory-gpu",
  "victory-loader",
@@ -779,6 +779,7 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "thiserror",
  "windows",
  "windows-sys",
@@ -928,15 +929,6 @@ name = "winnow"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
-
-[[package]]
-name = "xtask"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "walkdir",
-]
 
 [[package]]
 name = "zlib-rs"

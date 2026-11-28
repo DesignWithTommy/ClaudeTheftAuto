@@ -142,36 +142,11 @@ pub(crate) enum Shape {
 /// index and the shapes of the values it writes.
 pub(crate) struct Section {
     pub end: usize,
-    /// Past the `v_readlane_b32`s at constant lanes right after the restore (`end + 1..after`):
-    /// a lane read ignores EXEC, so they read what the section left, as inside it (the
-    /// compiler's wave64 reduction reads lane 63 after restoring EXEC).
-    pub after: usize,
     pub shapes: HashMap<Value, Shape>,
-}
-
-impl Section {
-    /// Whether instruction `i` of the block is one the simulation follows for the section
-    /// starting at `start`: inside it, or a lane read after the restore.
-    pub fn holds(&self, start: usize, i: usize) -> bool {
-        i > start && i < self.after && i != self.end
-    }
-}
-
-/// `VICTORY_SECTION_SCAN_CONT=1`: the section scan of a block goes on past a saveexec with no
-/// restore in the block. Off by default: it ends there, as before. Part of the shader cache key (`victory-gpu`'s).
-fn scan_continues() -> bool {
-    #[cfg(test)]
-    if let Some(v) = TEST_SCAN_CONT.with(|c| c.get()) {
-        return v;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SECTION_SCAN_CONT").is_some_and(|v| v == "1"))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test hook: forces the scan continuation on or off for the current test thread.
-    static TEST_SCAN_CONT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// What a `v_readlane_b32` of one lane takes, later in the block, from a
+    /// VGPR the section leaves (by the scalar it writes): the last lanes of
+    /// a reduction hold it before the first do.
+    pub reads: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -207,43 +182,29 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
-            // restored in a later block, or not at all: no section, but the block's later
-            // saveexecs may still make some (`VICTORY_SECTION_SCAN_CONT=0`: the scan ends)
-            if !scan_continues() {
-                break;
-            }
             i += 1;
             continue;
         };
-        // a lane read at a constant lane of a VGPR value the section wrote
-        let lane_read = |j: usize| {
-            let Some(x) = insts.get(j) else { return false };
-            let Fields::Valu(v) = &x.fields else { return false };
-            let lane = match v.src.get(1) {
-                Some(&Operand::Const(c)) => crate::resource::inline(c).is_some(),
-                Some(Operand::Literal(_)) => true,
-                _ => false,
-            };
-            let made = match v.src.first() {
-                Some(&Operand::Vector { reg, .. }) => x
-                    .read(Reg::V(reg))
-                    .is_some_and(|r| insts[i + 1..end].iter().any(|w| w.writes.iter().any(|&(_, y)| y == r))),
-                _ => false,
-            };
-            x.name() == "v_readlane_b32" && matches!(v.dst, Some(Operand::Scalar { .. })) && made && lane
-        };
-        let mut after = end + 1;
-        while lane_read(after) {
-            after += 1;
+        let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
+        let mut reads = HashMap::new();
+        for later in insts[end + 1..].iter().filter(|i| i.name() == "v_readlane_b32") {
+            if let Fields::Valu(v) = &later.fields
+                && let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, lane]) =
+                    (v.dst, &v.src[..])
+                && let Some(left) = later.read(Reg::V(*reg)).and_then(|x| vec.get(&x))
+                && let Some(w) = later.write(Reg::S(code))
+                && let Some(l) = lane_number(lane)
+                && let Some(&sym) = left.get(l as usize)
+                // (a lane's own value stays a lane read)
+                && !matches!(sym, Sym::Own(_))
+                && let Some(shape) = single(sym, wave)
+            {
+                reads.insert(w, shape);
+            }
         }
-        let shapes = if after > end + 1 {
-            let steps: Vec<Inst> = insts[i + 1..end].iter().chain(&insts[end + 1..after]).cloned().collect();
-            simulate(&steps, wave, saved, end - (i + 1))
-        } else {
-            simulate(&insts[i + 1..end], wave, saved, usize::MAX)
-        };
-        out.insert(i, Section { end, after, shapes });
-        i = after;
+        let shapes = shapes(vec, uni, wave);
+        out.insert(i, Section { end, shapes, reads });
+        i = end + 1;
     }
     out
 }
@@ -329,9 +290,19 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-/// `after`: from this step on, the lane reads past the restore ([`Section::after`]), which take
-/// only what the section computed (a lane's own value of something from before is not known).
-fn simulate(insts: &[Inst], wave: u32, saved: Value, after: usize) -> HashMap<Value, Shape> {
+/// The lane a `v_readlane_b32` names.
+fn lane_number(op: &Operand) -> Option<u32> {
+    match *op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    }
+}
+
+/// The lanes' values of the VGPRs the section writes, and its scalars.
+type Left = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -342,7 +313,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, after: usize) -> HashMap<Va
     let mut uni: HashMap<Value, Sym> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
-    for (step, inst) in insts.iter().enumerate() {
+    for inst in insts {
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
             // Constant lane sets (prefix sums); anything else ends what
@@ -352,7 +323,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, after: usize) -> HashMap<Va
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (vec, uni);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -367,7 +338,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, after: usize) -> HashMap<Va
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (vec, uni);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -405,6 +376,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, after: usize) -> HashMap<Va
             }
             continue;
         };
+        let f16_inline = name == "v_add_f16";
         let lanes = |op: &Operand,
                      vec: &HashMap<Value, Vec<Sym>>,
                      uni: &HashMap<Value, Sym>|
@@ -422,6 +394,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, after: usize) -> HashMap<Va
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
+                Operand::Const(c @ 240..=248) if f16_inline => {
+                    one(Sym::K(super::lower::inline_f16(c)))
+                }
                 Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
@@ -434,17 +409,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, after: usize) -> HashMap<Va
             else {
                 continue;
             };
-            let l = match *lane {
-                Operand::Const(c) => crate::resource::inline(c),
-                Operand::Literal(x) => Some(x),
-                _ => None,
-            };
+            let l = lane_number(lane);
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
                 let s = l
                     .and_then(|l| x.get(l as usize).copied())
                     .unwrap_or(Sym::Unknown);
-                let s = if step >= after && matches!(s, Sym::Own(_)) { Sym::Unknown } else { s };
                 uni.insert(w, s);
             }
             continue;
@@ -728,7 +698,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, after: usize) -> HashMap<Va
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (vec, uni)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -752,19 +722,10 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one.
-fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
-    uni: HashMap<Value, Sym>,
-    wave: u32,
-) -> HashMap<Value, Shape> {
-    let all = if wave == 64 {
-        u64::MAX
-    } else {
-        u64::from(u32::MAX)
-    };
-    let mut out = HashMap::new();
-    let single = |s: Sym| match s {
+/// The shape of a scalar.
+fn single(s: Sym, wave: u32) -> Option<Shape> {
+    let all = u64::MAX >> (64 - wave);
+    match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -782,9 +743,19 @@ fn shapes(
             high,
         } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
         _ => None,
-    };
+    }
+}
+
+/// The shape of each value, where every lane agrees on one.
+fn shapes(
+    vec: HashMap<Value, Vec<Sym>>,
+    uni: HashMap<Value, Sym>,
+    wave: u32,
+) -> HashMap<Value, Shape> {
+    let all = u64::MAX >> (64 - wave);
+    let mut out = HashMap::new();
     for (v, s) in uni {
-        if let Some(sh) = single(s) {
+        if let Some(sh) = single(s, wave) {
             out.insert(v, sh);
         }
     }
@@ -1138,6 +1109,40 @@ mod tests {
         }
     }
 
+    /// A wave OR whose last step stays in the section's VGPR: the lower
+    /// lanes add the first half's to themselves, so only the upper ones
+    /// hold the whole, and the last lane is read after the section (an
+    /// upscaler's programs).
+    #[test]
+    fn one_lane_of_what_a_section_leaves_is_read_after_it() {
+        let words = |lane: u32| {
+            let mut w = WAVE_OR_V7_TO_S7[..14].to_vec(); // .. v_or_b32 v1, v2, v1
+            w.extend([
+                0xD760_0007,
+                0x0001_0101, // v_readlane_b32 s7, v1, 0
+                0x3802_0207, // v_or_b32 v1, s7, v1
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0xD760_0006,
+                0x0001_0101 | lane << 9, // v_readlane_b32 s6, v1, lane
+                S_ENDPGM,
+            ]);
+            w
+        };
+        let read = |lane: u32| {
+            let p = build(&words(lane), true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            let got = insts[insts.len() - 2].write(Reg::S(6)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+            (sec.reads.get(&got).copied(), Shape::Active(Op::Or, v7, saved, 0))
+        };
+        let (found, whole) = read(63);
+        assert_eq!(found, Some(whole));
+        // Lane 0 has the first half's alone: still a lane read.
+        assert_eq!(read(0).0, None);
+    }
+
     /// `WaveActiveSum` of 16-bit floats, as compiled in
     /// `compute_graph_ops:CS_TransposeVecMatMulAlignedOperation` (0x19c on): the tree the
     /// lowering reproduces. A tree in another order is not followed.
@@ -1183,45 +1188,6 @@ mod tests {
         // lanes two apart first, neighbours second: every lane counted once, but
         // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
         let (found, _) = shape(&words(quads, pairs));
-        assert_eq!(found, None);
-    }
-
-    /// The wave64 OR as the FidelityFX upscaler's programs end (17af85f170e66f30, 0x6530-0x6578):
-    /// lane 0's half ORed into every lane inside the section, then lane 63 read after EXEC is
-    /// restored. A lane read ignores EXEC, so it reads the section's result. With lane 32
-    /// instead of 0 inside, lane 63 holds its own half only: no shape.
-    #[test]
-    fn a_lane_read_after_the_restore_reads_what_the_section_left() {
-        let words = |inside: u32, after: u32| {
-            let mut w = WAVE_OR_V7_TO_S7[..15].to_vec();
-            w.extend_from_slice(&[
-                inside,      // v_readlane_b32 s7, v1, <inside>
-                0x3802_0207, // v_or_b32 v1, s7, v1
-                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-                0xD760_0006,
-                after, // v_readlane_b32 s6, v1, <after>
-                0x8706_0706, // s_and_b32 s6, s6, s7
-            ]);
-            w
-        };
-        let shape = |w: &[u32]| {
-            let p = build(w, true);
-            let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(4)).unwrap();
-            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
-            let read = insts.iter().position(|i| i.name() == "v_readlane_b32" && i.write(Reg::S(6)).is_some()).unwrap();
-            let total = insts[read].write(Reg::S(6)).unwrap();
-            let secs = sections(&p, 0);
-            let sec = &secs[&0];
-            assert_eq!((sec.end, sec.after), (read - 1, read + 1));
-            assert!(sec.holds(0, read) && !sec.holds(0, sec.end) && !sec.holds(0, read + 1));
-            (sec.shapes.get(&total).copied(), Shape::Active(Op::Or, v7, saved, 0))
-        };
-        // lane 0, then lane 63 after the restore
-        let (found, want) = shape(&words(0x0001_0101, 0x0001_7F01));
-        assert_eq!(found, Some(want));
-        // lane 32 inside: lane 63 holds the upper half's OR only
-        let (found, _) = shape(&words(0x0001_4101, 0x0001_7F01));
         assert_eq!(found, None);
     }
 
@@ -1330,11 +1296,10 @@ mod tests {
     }
 
     /// A saveexec of every lane whose restore is not in the block (it lies in a later one) is
-    /// no section, and the sections after it in the block are still found: the scan used to
-    /// stop at the first unmatched one. (Ported from PiloteBox d193085a, GPL-3.0.)
+    /// no section, and the sections after it in the block are still found (upstream #3187):
+    /// the scan used to stop at the first unmatched one.
     #[test]
     fn an_unmatched_saveexec_leaves_the_later_sections_of_its_block() {
-        TEST_SCAN_CONT.with(|c| c.set(Some(true)));
         let total = |w: &[u32], start: usize| {
             let p = build(w, true);
             let insts = &p.blocks[0].insts;
@@ -1354,5 +1319,68 @@ mod tests {
         w.extend(WAVE_OR_V7_TO_S7);
         let (after, want) = total(&w, 1);
         assert_eq!(after, Some(want), "the section after an unmatched saveexec");
+    }
+
+    #[test]
+    fn v_add_f16_inline_float_constants_are_not_zero_identity() {
+        // Wave32 f16 sum reduction with an extra `v_add_f16 v1, <const>, v1`
+        // step: 0 (code 128) is a true additive identity, whereas inline float
+        // constants (240..=248: 0.5, -0.5, 1.0, ..., 1/(2*pi)) are non-zero
+        // f16 values on GFX10 and must not be decoded as f32 bits whose low 15
+        // bits happen to be zero.
+        let run = |src_const: u16| -> (Option<Shape>, Value, Value) {
+            let mut w = vec![sop1(0, 0x3D, 193)]; // s_or_saveexec_b32 s0, -1
+            w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s0
+            w.push(vop2(1, 0x32, src_const, 1)); // v_add_f16 v1, <const>, v1
+            for ctrl in [0x00B1u16, 0x004E, 0x0164, 0x0168] {
+                w.push(vop2(1, 0x32, 0xFA, 1));
+                w.push(dpp16(1, ctrl, 0xF, 0xF, false));
+            }
+            w.extend(vop3(2, 0x378, 257, 128, 128)); // v_permlanex16_b32 v2, v1, 0, 0
+            w.push(vop2(1, 0x32, 258, 1)); // v_add_f16 v1, v2, v1
+            w.extend(vop3(1, 0x360, 257, 128 + 31, 0)); // v_readlane_b32 s1, v1, 31
+            w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+
+            let p = build(&w, false);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(0)).unwrap();
+            let v0_in = insts[1].read(Reg::V(0)).unwrap();
+            let s1 = insts[insts.len() - 3].write(Reg::S(1)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+            (sec.shapes.get(&s1).copied(), v0_in, saved)
+        };
+
+        let (zero_shape, v0_in, saved) = run(128);
+        assert_eq!(
+            zero_shape,
+            Some(Shape::Active(Op::AddH, v0_in, saved, 0))
+        );
+        for c in 240..=248u16 {
+            let (shape, _, _) = run(c);
+            assert_eq!(shape, None, "inline float const {c} was treated as identity");
+        }
+
+        // Also verify `v_add_f16 v1, <const>, 0` preserves the exact GFX10 f16
+        // inline constant bits (not the f32 bits whose low half is zero).
+        let expected_f16: [u32; 9] = [
+            0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+        ];
+        for (i, &want) in expected_f16.iter().enumerate() {
+            let c = 240u16 + i as u16;
+            let w = [
+                sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+                vop1(2, 0x01, 128), // v_mov_b32 v2, 0
+                vop2(1, 0x32, c, 2), // v_add_f16 v1, <const>, v2
+                sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+            ];
+            let p = build(&w, false);
+            let v1 = p.blocks[0].insts[2].write(Reg::V(1)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+            assert_eq!(
+                sec.shapes.get(&v1),
+                Some(&Shape::K(want)),
+                "inline float const {c} decoded with wrong f16 bits"
+            );
+        }
     }
 }
