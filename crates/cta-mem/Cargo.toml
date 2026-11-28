@@ -1,0 +1,13 @@
+[package]
+name = "cta-mem"
+description = "CTA's memory core: one home for title memory, per-64 KiB block tiers, and a bounded upload ring (PLAN.md 2.1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

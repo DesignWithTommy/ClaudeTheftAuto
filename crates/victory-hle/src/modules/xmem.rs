@@ -504,6 +504,11 @@ fn physical() -> MutexGuard<'static, Physical> {
 fn pages_per_section() -> usize {
     static PER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PER.get_or_init(|| {
+        // CTA: the home is 2 MiB committed sections (cta-mem, PLAN.md 2.1).
+        if cta_mem::enabled() && !on_wine() {
+            tracing::info!("CTA_MEM: title memory homed in 2 MiB committed sections");
+            return cta_mem::home::pages_per_section(PAGE as u64);
+        }
         let mb = std::env::var("VICTORY_SECTION_MB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -537,7 +542,8 @@ fn allocate_physical(n: usize, flags: u64, per: usize, pages: *mut usize) -> boo
                 // until touched, and committing a reserved one page by page
                 // costs a wineserver request each that scans every range
                 // committed so far: commit it whole there.
-                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                // CTA_MEM: committed so the GPU can open the home in place.
+                PAGE_READWRITE | if on_wine() || cta_mem::enabled() { SEC_COMMIT } else { SEC_RESERVE },
                 (size as u64 >> 32) as u32,
                 size as u32,
                 std::ptr::null(),
@@ -562,7 +568,7 @@ fn allocate_physical(n: usize, flags: u64, per: usize, pages: *mut usize) -> boo
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     for (section, chunk) in &chunks {
-        victory_gpu::title_memory_section(section.0 as usize, (chunk * PAGE) as u64, on_wine());
+        victory_gpu::title_memory_section(section.0 as usize, (chunk * PAGE) as u64, on_wine() || cta_mem::enabled());
     }
     let mut physical = physical();
     let first = physical.next_page;
