@@ -52,6 +52,32 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// bytes; refused: not one stretch and not private, not committed, by the
 /// host; regions forgotten.
 static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Why windows and buffers were refused, by how the views cover them:
+/// none (and not private memory whole), holes, scattered, a run the host
+/// refused; then, of "none", private memory partly committed or of
+/// another protection, and memory that is a view with nothing known.
+static WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn why(start: u64, len: u64) {
+    use crate::inplace::Cover;
+    let i = match crate::inplace::cover(start as usize, len as usize) {
+        Cover::None => {
+            let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { mem::VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+            if n != 0 && info.Type == mem::MEM_PRIVATE {
+                WHY[4].fetch_add(1, Ordering::Relaxed);
+            } else {
+                WHY[5].fetch_add(1, Ordering::Relaxed);
+            }
+            0
+        }
+        Cover::Holes => 1,
+        Cover::Scattered => 2,
+        Cover::Run(..) => 3,
+    };
+    WHY[i].fetch_add(1, Ordering::Relaxed);
+}
 
 /// Title memory `[start, start + len)` as the title's own pages, or `None`
 /// for the caller's copy.
@@ -76,6 +102,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         None => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            why(start, len);
         }
     }
     placed
@@ -218,5 +245,11 @@ pub(crate) fn log() {
         target: "cta_mem",
         "cta home: {} buffers and windows in place ({} MB, no host copy) over {} regions ({} MB opened); refused {}: {} not committed, {} by the host; {} regions forgotten; {} card copies fed from the title's pages ({} MB, no RAM copy)",
         s[2], s[3] >> 20, s[0], s[1] >> 20, s[4], s[5], s[6], s[7], s[8], s[9] >> 20,
+    );
+    let w: Vec<u64> = WHY.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        target: "cta_mem",
+        "cta home refusals by cover: {} no view ({} private memory not whole or not plain, {} other), {} with holes, {} scattered over views, {} one run refused",
+        w[0], w[4], w[5], w[1], w[2], w[3],
     );
 }
