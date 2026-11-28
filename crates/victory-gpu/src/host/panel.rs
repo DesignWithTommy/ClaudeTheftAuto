@@ -74,7 +74,13 @@ fn shown() -> &'static AtomicBool {
 }
 
 /// F3 was pressed since the last call, with one of our windows in front.
+/// Never with `VICTORY_PANEL=0`: the launcher (i95) draws its own panel
+/// over the game then, and F3 toggled both, two panels on screen.
 fn pressed() -> bool {
+    static BARRED: OnceLock<bool> = OnceLock::new();
+    if *BARRED.get_or_init(|| std::env::var_os("VICTORY_PANEL").is_some_and(|v| v == "0")) {
+        return false;
+    }
     static DOWN: AtomicBool = AtomicBool::new(false);
     // SAFETY: a plain query.
     let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;

@@ -4800,8 +4800,8 @@ impl Shadow {
             let at = lo - self.start as usize;
             if self.titled() {
                 // The CPU's side is the title's pages: the chunks whose
-                // hash changed.
-                return Ok(Some(self.titled_runs(at, at + n, false).into_iter().map(|(x, y)| (x - at, y - at)).collect()));
+                // hash changed, as (offset in the page, bytes).
+                return Ok(Some(self.titled_runs(at, at + n, false).into_iter().map(|(x, y)| (x - at, y - x)).collect()));
             }
             // SAFETY: the caller's.
             let held = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
